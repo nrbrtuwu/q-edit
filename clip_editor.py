@@ -65,6 +65,7 @@ RATIOS = {"Free": None, "16:9": 16 / 9, "9:16": 9 / 16, "1:1": 1.0, "4:5": 4 / 5
 HANDLE = 6
 MIN_CROP = 32
 PREVIEW_FPS_CAP = 30
+SOUND_LEAD = 0.12   # s: ffplay needs about this long to open the device, so its sound starts ahead
 IMAGE_EXT = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
 MEDIA_EXT = IMAGE_EXT | {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v", ".mp3", ".wav", ".m4a",
                          ".aac", ".flac", ".ogg"}
@@ -72,7 +73,7 @@ IMAGE_DUR = 5.0
 MIN_CLIP = 0.05
 MEDIA_TYPES = [("Media", "*.mp4 *.mov *.mkv *.avi *.webm *.m4v *.mp3 *.wav *.m4a *.aac *.flac "
                          "*.ogg *.png *.jpg *.jpeg *.bmp *.webp"), ("All files", "*.*")]
-APP_VERSION = "1.8.0"
+APP_VERSION = "1.8.1"
 FROZEN = getattr(sys, "frozen", False)  # True when running from the installed .exe
 APP_DIR = Path(sys.executable).parent if FROZEN else Path(__file__).parent
 DATA_DIR = Path(getattr(sys, "_MEIPASS", APP_DIR))
@@ -541,37 +542,54 @@ def audio_args(audio, abr, opus_enc):
 # ---------------------------------------------------------------- playback
 class Player:
     """Reads raw RGB frames from an ffmpeg command in a thread.
-    Sound: a second ffmpeg mixes the audio to WAV and pipes it into ffplay."""
+    Sound: a second ffmpeg mixes the audio to WAV and pipes it into ffplay. The picture's
+    graph can take a while to start (many clips, sped-up clips), so ffplay is only started
+    once the first frame is there; the sound's ffmpeg starts right away and waits in its pipe.
+    acmd starts SOUND_LEAD later than the picture, which covers ffplay's own start-up."""
 
     def __init__(self, vcmd, acmd, size, fps, volume=100):
         self.w, self.h = size
         self.fps = fps
         self.stopped = False
+        self.first_at = None   # perf_counter() when the first frame came in: the clock's zero
         self.frames = queue.Queue(maxsize=8)
+        self.lock = threading.Lock()
         self.proc = subprocess.Popen(vcmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                      stdin=subprocess.DEVNULL, creationflags=NOWIN)
         self.feed = self.sound = None
-        self.set_sound(acmd, volume)
+        self.volume = volume
+        self._open_feed(acmd)
         threading.Thread(target=self._read, daemon=True).start()
+
+    def _open_feed(self, acmd):
+        if acmd and self.volume >= 1 and shutil.which("ffplay"):
+            self.feed = subprocess.Popen(acmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                         stdin=subprocess.DEVNULL, creationflags=NOWIN)
+
+    def _start_sound(self):
+        with self.lock:
+            if self.feed and not self.sound and not self.stopped:
+                self.sound = subprocess.Popen(
+                    ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet",
+                     "-volume", str(int(min(max(self.volume, 0), 100))), "-i", "-"],
+                    stdin=self.feed.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    creationflags=NOWIN)
+                self.feed.stdout.close()
 
     def set_sound(self, acmd, volume):
         """(Re)starts the sound; used for a volume change while the picture keeps playing."""
-        for p in (self.feed, self.sound):
-            if p:
-                try:
-                    p.kill()
-                except OSError:
-                    pass
-        self.feed = self.sound = None
-        if acmd and volume >= 1 and shutil.which("ffplay"):
-            self.feed = subprocess.Popen(acmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                         stdin=subprocess.DEVNULL, creationflags=NOWIN)
-            self.sound = subprocess.Popen(
-                ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet",
-                 "-volume", str(int(min(max(volume, 0), 100))), "-i", "-"],
-                stdin=self.feed.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                creationflags=NOWIN)
-            self.feed.stdout.close()
+        with self.lock:
+            for p in (self.feed, self.sound):
+                if p:
+                    try:
+                        p.kill()
+                    except OSError:
+                        pass
+            self.feed = self.sound = None
+            self.volume = volume
+            self._open_feed(acmd)
+        if self.first_at is not None:
+            self._start_sound()
 
     def _put(self, item):
         while not self.stopped:
@@ -587,11 +605,16 @@ class Player:
             buf = self.proc.stdout.read(n)
             if len(buf) < n:
                 break
+            if self.first_at is None:
+                self.first_at = time.perf_counter()
+                self._start_sound()
             self._put(buf)
+        self._start_sound()   # no picture at all: play the sound anyway
         self._put(None)
 
     def stop(self):
-        self.stopped = True
+        with self.lock:
+            self.stopped = True
         for p in (self.proc, self.feed, self.sound):
             if p:
                 try:
@@ -2600,7 +2623,7 @@ class App:
                 self.resume = self.player is not None
                 self.pause()
                 self.tdrag = {"mode": "scrub"}
-                self.seek(self.x2t(e.x))
+                self.seek(self.scrub_t(e))
             return
         if e.x < HEAD_W:
             r = self.row_at(e.y)
@@ -2621,7 +2644,7 @@ class App:
             self.resume = self.player is not None
             self.pause()
             self.tdrag = {"mode": "scrub"}
-            self.seek(self.x2t(e.x))
+            self.seek(self.scrub_t(e))
             self.draw_timeline()
             return
         if cl["id"] != self.insp_focus:
@@ -2641,6 +2664,18 @@ class App:
         self.tdrag = {"mode": part, "id": cl["id"], "x": e.x, "y": e.y, "moved": False,
                       "before": self.snapshot(),
                       "orig": {i: dict(self.by_id(i)) for i in self.sel}}
+
+    def scrub_t(self, e):
+        """Playhead time under the mouse; with snapping on it jumps onto cuts (clip starts /
+        ends) and the in / out marks within a few pixels. Shift = no snapping."""
+        t = max(self.x2t(e.x), 0.0)
+        if not self.snap.get() or e.state & 0x0001:
+            return t
+        pts = [0.0] + [m for m in (self.mark_in, self.mark_out) if m is not None]
+        for c in self.clips:
+            pts += [c["start"], c["start"] + c["dur"]]
+        best = min(pts, key=lambda p: abs(p - t))
+        return best if abs(best - t) * self.pps <= SNAP_PX else t
 
     def snap_points(self, skip):
         pts = [0.0, self.cur]
@@ -2666,7 +2701,7 @@ class App:
         if not d:
             return
         if d["mode"] == "scrub":
-            self.seek(self.x2t(e.x))
+            self.seek(self.scrub_t(e))
             return
         if d["mode"] == "height":
             h = min(max(d["h0"] + e.y - d["y"], TRACK_MIN_H), TRACK_MAX_H)
@@ -3098,8 +3133,8 @@ class App:
                 ["-filter_complex", ";".join(parts), "-map", "[pv]",
                  "-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
         self.play_end = end
-        self.player = Player(vcmd, self.sound_cmd(self.cur, end), (W, H), float(self.fps_str(fps)),
-                             self.pvol.get())
+        self.player = Player(vcmd, self.sound_cmd(min(self.cur + SOUND_LEAD, end), end), (W, H),
+                             float(self.fps_str(fps)), self.pvol.get())
         self.play_from, self.shown, self.t0 = self.cur, 0, None
         self.play_btn.config(text=ICON["pause"])
         self.tick()
@@ -3140,7 +3175,7 @@ class App:
         save_settings(self.settings)
         if self.player:
             # the new sound starts a little ahead, as ffplay needs a moment to open the device
-            t = min(self.cur + 0.12, self.play_end)
+            t = min(self.cur + SOUND_LEAD, self.play_end)
             self.player.set_sound(self.sound_cmd(t, self.play_end), self.pvol.get())
 
     def pause(self):
@@ -3178,7 +3213,7 @@ class App:
             latest = d
             self.shown += 1
             if self.t0 is None:
-                self.t0 = time.perf_counter()
+                self.t0 = p.first_at or time.perf_counter()
         if latest is not None:
             self.frame = Image.frombuffer("RGB", (p.w, p.h), latest, "raw", "RGB", 0, 1)
             self.cur = min(self.tl_end(), self.play_from + (self.shown - 1) / p.fps)
