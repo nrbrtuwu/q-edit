@@ -17,6 +17,7 @@ Shortcuts:
   I / O         mark in / out at the playhead (export and loop range)
   Home / End    jump to in / out
   Ctrl+B        split clips at the playhead
+  Ctrl+C / X / V  copy / cut / paste clips (paste goes in at the playhead)
   Del           delete selected clips   (Shift+Del: ripple delete, closes the gap)
   Ctrl+Z / Y    undo / redo
   Ctrl+wheel    zoom timeline   (wheel scrolls it)
@@ -65,7 +66,7 @@ IMAGE_DUR = 5.0
 MIN_CLIP = 0.05
 MEDIA_TYPES = [("Media", "*.mp4 *.mov *.mkv *.avi *.webm *.m4v *.mp3 *.wav *.m4a *.aac *.flac "
                          "*.ogg *.png *.jpg *.jpeg *.bmp *.webp"), ("All files", "*.*")]
-APP_VERSION = "1.7.1"
+APP_VERSION = "1.7.2"
 FROZEN = getattr(sys, "frozen", False)  # True when running from the installed .exe
 APP_DIR = Path(sys.executable).parent if FROZEN else Path(__file__).parent
 DATA_DIR = Path(getattr(sys, "_MEIPASS", APP_DIR))
@@ -261,7 +262,8 @@ def probe(path):
     """Returns {"dur", "fps", "audio", "video", "size"}."""
     r = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries",
-         "format=duration:stream=codec_type,avg_frame_rate,r_frame_rate,width,height",
+         "format=duration:stream=codec_type,avg_frame_rate,r_frame_rate,width,height:"
+         "stream_tags=rotate:stream_side_data=rotation",
          "-of", "json", path],
         capture_output=True, text=True, creationflags=NOWIN)
     try:
@@ -280,6 +282,15 @@ def probe(path):
             got_video = True
             if s.get("width") and s.get("height"):
                 size = (int(s["width"]), int(s["height"]))
+                # phone videos are often stored sideways with a rotation flag; FFmpeg shows them
+                # upright, so the size has to be turned too
+                rot = (s.get("tags") or {}).get("rotate") or next(
+                    (d.get("rotation") for d in s.get("side_data_list") or [] if "rotation" in d), 0)
+                try:
+                    if round(float(rot)) % 180 == 90:
+                        size = size[::-1]
+                except (TypeError, ValueError):
+                    pass
             for key in ("avg_frame_rate", "r_frame_rate"):
                 n, _, d = (s.get(key) or "0/0").partition("/")
                 try:
@@ -1221,6 +1232,7 @@ class App:
         self.pps, self.view_t, self.yoff = 40.0, 0.0, 0.0
         self.tdrag = self.hover = None
         self.drop = None   # files being dragged in from Explorer: {"key", "paths", "target"}
+        self.clipboard = []   # copied clips, start relative to the earliest one
         self.thumbs, self.peaks, self.tiles = {}, {}, {}   # timeline filmstrips and waveforms
         self.crop = [0.0, 0.0, 0.0, 0.0]
         self.frame = self.frame_photo = self.photo_key = None
@@ -1326,6 +1338,9 @@ class App:
                                    postcommand=self.fill_recent)
         file_menu.insert_cascade(2, label="Open recent", menu=self.recent_menu)
         menu("Edit", [("Undo", "Ctrl+Z", self.undo), ("Redo", "Ctrl+Y", self.redo), None,
+                      ("Cut", "Ctrl+X", lambda: self.copy_sel(True)),
+                      ("Copy", "Ctrl+C", self.copy_sel),
+                      ("Paste at playhead", "Ctrl+V", self.paste), None,
                       ("Split at playhead", "Ctrl+B", self.split),
                       ("Delete", "Del", self.delete_sel),
                       ("Ripple delete", "Shift+Del", lambda: self.delete_sel(True)),
@@ -1492,6 +1507,9 @@ class App:
                         ("<Control-e>", lambda e: self.export()),
                         ("<Control-a>", lambda e: self.select(c["id"] for c in self.clips)),
                         ("<Control-b>", lambda e: self.split()),
+                        ("<Control-c>", lambda e: self.copy_sel()),
+                        ("<Control-x>", lambda e: self.copy_sel(True)),
+                        ("<Control-v>", lambda e: self.paste()),
                         ("<Control-B>", lambda e: self.split()),
                         ("<Delete>", lambda e: self.delete_sel()),
                         ("<BackSpace>", lambda e: self.delete_sel()),
@@ -1601,6 +1619,12 @@ class App:
     def tracks(self, kind):
         return self.vtracks if kind == "v" else self.atracks
 
+    def frame_t(self):
+        """Time of the preview still: the playhead, kept just inside the last clip when it sits
+        on its very end (past the end there is nothing, so the frame is black)."""
+        end = self.tl_end()
+        return min(self.cur, max(end - 0.05, 0.0)) if end - 0.05 <= self.cur <= end else self.cur
+
     def tl_end(self):
         return max((c["start"] + c["dur"] for c in self.clips), default=0.0)
 
@@ -1654,7 +1678,7 @@ class App:
 
     def after_edit(self):
         self.sel &= {c["id"] for c in self.clips}
-        self.cur = min(self.cur, self.tl_end())
+        self.cur = max(self.cur, 0.0)
         self.draw_timeline()
         self.update_range()
         self.update_time()
@@ -1735,6 +1759,57 @@ class App:
             self.cur = min(gone, key=lambda c: c["start"])["start"]
         self.sel.clear()
         self.commit(before)
+
+    def copy_sel(self, cut=False):
+        """Ctrl+C / Ctrl+X: the selected clips (with their settings) go to the clipboard."""
+        chosen = [c for c in self.clips if c["id"] in self.sel]
+        if not chosen:
+            return
+        t0 = min(c["start"] for c in chosen)
+        self.clipboard = [dict(copy.deepcopy(c), start=c["start"] - t0) for c in chosen]
+        n = f"{len(chosen)} clip{'' if len(chosen) == 1 else 's'}"
+        if cut:
+            self.delete_sel()
+        self.status.config(text=f"{'Cut' if cut else 'Copied'} {n}   ·   Ctrl+V pastes at the "
+                                f"playhead")
+
+    def paste(self, t=None):
+        """Ctrl+V: the clipboard goes in at the playhead (or t) on the same tracks, over what's
+        there, like a drop. The pasted clips are selected and the playhead moves to their end,
+        so pasting again puts the next copy right after."""
+        if not self.clipboard:
+            return
+        self.pause()
+        t = self.cur if t is None else max(t, 0.0)
+        new, links = [], {}
+        for c in self.clipboard:
+            if not self.load_media(c["path"]):
+                continue
+            n = copy.deepcopy(c)
+            n.update(id=self.new_id(), start=t + c["start"],
+                     link=links.setdefault(c["link"], self.new_id()) if c["link"] else None)
+            n.pop("fill", None)
+            new.append(n)
+        if not new:
+            return
+        before = self.snapshot()
+        if not self.vw:   # pasted into an empty project: the first picture sets the frame
+            m = next((self.media[n["path"]] for n in new if n["kind"] == "v"), None)
+            self.vw, self.vh = (m and m.get("size")) or (1920, 1080)
+            self.crop = [0.0, 0.0, float(self.vw), float(self.vh)]
+            self.apply_ratio()
+        for n in new:
+            tracks = self.tracks(n["kind"])
+            while len(tracks) <= n["track"]:
+                tracks.append({"hidden": False} if n["kind"] == "v" else {"muted": False})
+            self.clear_range(n["kind"], n["track"], n["start"], n["start"] + n["dur"], set())
+        self.clips += new
+        self.sel = {n["id"] for n in new}
+        self.cur = max(n["start"] + n["dur"] for n in new)
+        self.commit(before)
+        self.follow_playhead()
+        self.status.config(text=f"Pasted {len(new)} clip{'' if len(new) == 1 else 's'} at "
+                                f"{fmt_time(t)}")
 
     def toggle_link(self):
         chosen = [c for c in self.clips if c["id"] in self.sel]
@@ -2265,7 +2340,7 @@ class App:
             self.draw_playhead()
 
     def scroll_total(self):
-        return max(self.tl_end(), self.view_t) + self.vis_secs()
+        return max(self.tl_end(), self.view_t, self.cur) + self.vis_secs()
 
     def update_scrollbar(self):
         total = self.scroll_total()
@@ -2495,7 +2570,7 @@ class App:
             self.commit(d["before"])
 
     def on_tl_right(self, e):
-        if e.y < RULER_H or not self.clips and e.x >= HEAD_W:
+        if e.y < RULER_H or not (self.clips or self.clipboard) and e.x >= HEAD_W:
             return
         menu = tk.Menu(self.root, tearoff=0, bg=FIELD, fg=FG, activebackground=ACCENT,
                        activeforeground="white", bd=0, font=UI_FONT)
@@ -2509,10 +2584,19 @@ class App:
                              state="normal" if len(self.tracks(kind)) > 1 else "disabled")
         else:
             cl, _ = self.clip_at(e.x, e.y)
+            at = max(self.x2t(e.x), 0.0)
+            paste_here = ("normal" if self.clipboard else "disabled")
             if not cl:
+                menu.add_command(label=f"Paste here   ({fmt_time(at)})",
+                                 command=lambda: self.paste(at), state=paste_here)
+                menu.tk_popup(e.x_root, e.y_root)
                 return
             if cl["id"] not in self.sel:
                 self.select(self.linked(cl))
+            menu.add_command(label="Cut   Ctrl+X", command=lambda: self.copy_sel(True))
+            menu.add_command(label="Copy   Ctrl+C", command=self.copy_sel)
+            menu.add_command(label="Paste at playhead   Ctrl+V", command=self.paste, state=paste_here)
+            menu.add_separator()
             menu.add_command(label="Split at playhead   Ctrl+B", command=self.split)
             menu.add_command(label="Delete   Del", command=self.delete_sel)
             menu.add_command(label="Ripple delete   Shift+Del", command=lambda: self.delete_sel(True))
@@ -2660,7 +2744,7 @@ class App:
         few ms, so sliders update while they move. Returns False while a source frame loads."""
         if not self.clips or self.player:
             return False
-        t = min(self.cur, max(self.tl_end() - 0.05, 0.0))
+        t = self.frame_t()
         W, H = self.preview_size()
         layers = self.visible_layers(t)
         missing = [c for c in layers if self.src_key(c, t) not in self.src_cache]
@@ -2743,7 +2827,7 @@ class App:
     def prefetch_sources(self):
         """Warms the cache for the clips under the playhead, so the first slider move is live."""
         if self.clips and not self.player and self.sel:
-            t = min(self.cur, max(self.tl_end() - 0.05, 0.0))
+            t = self.frame_t()
             W, H = self.preview_size()
             self.fetch_sources(self.visible_layers(t), t, W, H)
 
@@ -2754,7 +2838,7 @@ class App:
         self.prefetch_sources()
         self.req += 1
         W, H = self.preview_size()
-        t = min(self.cur, max(self.tl_end() - 0.05, 0.0))
+        t = self.frame_t()
         inputs, parts, vout, _, _ = self.graph(t, t + 0.2, W, H, self.fps_str(self.pfps),
                                                audio=False)
         parts.append(f"{vout}format=rgb24[pv]")
@@ -2942,7 +3026,7 @@ class App:
         playing = self.player is not None
         if playing:
             self.pause()
-        self.cur = min(max(t, 0.0), self.tl_end())
+        self.cur = max(t, 0.0)   # anywhere, also past the last clip (the preview is black there)
         self.update_time()
         self.draw_playhead()
         if playing:
@@ -3216,7 +3300,7 @@ class App:
         """The selected visual clip under the playhead (it gets the on-screen handles)."""
         if self.player or not self.clips:
             return None
-        t = min(self.cur, max(self.tl_end() - 0.05, 0.0))
+        t = self.frame_t()
         sel = [c for c in self.visible_layers(t) if c["id"] in self.sel]
         if not sel:
             return None
@@ -3251,8 +3335,8 @@ class App:
 
     def hit(self, ex, ey):
         """What a click on the preview grabs: the selected clip's corners (scale), the crop
-        corners, a clip's picture (move; the selected one first, then the topmost), or the
-        crop box's edge (move the crop)."""
+        corners, the topmost clip's picture under the mouse (move), or the crop box's edge
+        (move the crop)."""
         tgt = self.preview_target()
         if tgt:
             for px, py in self.clip_corners(tgt):
@@ -3264,10 +3348,10 @@ class App:
             px, py = self.to_cv(sx, sy)
             if abs(ex - px) <= HANDLE + 3 and abs(ey - py) <= HANDLE + 3:
                 return "resize", (ax, ay)
-        if tgt and self.in_clip(tgt, ex, ey):
-            return "clip", tgt
+        # the topmost clip under the mouse, even when another one is selected: a selected clip
+        # underneath (often the full-frame video) must not swallow clicks on what's on top
         if not self.player and self.clips:
-            t = min(self.cur, max(self.tl_end() - 0.05, 0.0))
+            t = self.frame_t()
             for c in reversed(self.visible_layers(t)):
                 if self.in_clip(c, ex, ey):
                     return "clip", c
