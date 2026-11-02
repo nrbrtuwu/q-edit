@@ -1,0 +1,4290 @@
+#!/usr/bin/env python3
+"""
+q-edit: a small dark-mode multi-track video editor (cut, splice, crop, export),
+with a Post to TikTok panel (caption, cover, on-video text) for finished exports.
+
+Needs:  Python 3, FFmpeg on PATH (ffplay too, for preview sound), Pillow, tkinterdnd2 (optional,
+        for dragging files in from Explorer)
+        winget install ffmpeg
+        pip install pillow tkinterdnd2
+Run:    python clip_editor.py
+
+Shortcuts:
+  Space         play / pause
+  Left/Right    step 1 s   (hold Shift for 5 s)
+  I / O         mark in / out at the playhead (export and loop range)
+  Home / End    jump to in / out
+  Ctrl+B        split clips at the playhead
+  Del           delete selected clips   (Shift+Del: ripple delete, closes the gap)
+  Ctrl+Z / Y    undo / redo
+  Ctrl+wheel    zoom timeline   (wheel scrolls it)
+  Ctrl+T        post the last export to TikTok
+"""
+
+import copy
+from array import array
+import json
+import math
+import os
+import queue
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import tkinter as tk
+import tkinter.font as tkfont
+from concurrent.futures import ThreadPoolExecutor
+from io import BytesIO
+from pathlib import Path
+from tkinter import filedialog, messagebox, ttk
+
+try:
+    from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageTk
+except ImportError:
+    print("Pillow is missing. Install it with:  pip install pillow")
+    sys.exit(1)
+
+try:   # drag and drop from Explorer (pip install tkinterdnd2); the app works without it
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+except ImportError:
+    TkinterDnD = None
+
+import tiktok_api
+from tiktok_api import TikTok, TikTokError
+
+NOWIN = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+RATIOS = {"Free": None, "16:9": 16 / 9, "9:16": 9 / 16, "1:1": 1.0, "4:5": 4 / 5, "4:3": 4 / 3}
+HANDLE = 6
+MIN_CROP = 32
+PREVIEW_FPS_CAP = 30
+IMAGE_EXT = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
+MEDIA_EXT = IMAGE_EXT | {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v", ".mp3", ".wav", ".m4a",
+                         ".aac", ".flac", ".ogg"}
+IMAGE_DUR = 5.0
+MIN_CLIP = 0.05
+MEDIA_TYPES = [("Media", "*.mp4 *.mov *.mkv *.avi *.webm *.m4v *.mp3 *.wav *.m4a *.aac *.flac "
+                         "*.ogg *.png *.jpg *.jpeg *.bmp *.webp"), ("All files", "*.*")]
+APP_VERSION = "1.5.0"
+FROZEN = getattr(sys, "frozen", False)  # True when running from the installed .exe
+APP_DIR = Path(sys.executable).parent if FROZEN else Path(__file__).parent
+DATA_DIR = Path(getattr(sys, "_MEIPASS", APP_DIR))
+ICON_FILE = DATA_DIR / "clip_editor.ico"
+# the install folder is read-only, so the installed app keeps settings in %APPDATA%
+SETTINGS_FILE = (Path(os.environ.get("APPDATA", Path.home())) / "q-edit" / "settings.json"
+                 if FROZEN else APP_DIR / "clip_editor_settings.json")
+TIKTOK_FILE = SETTINGS_FILE.parent / "tiktok.dat"   # keys + login, DPAPI-encrypted
+FONT_FILE = DATA_DIR / "fonts" / "TikTokSans36pt-Bold.ttf"
+
+
+def migrate_settings_dir():
+    """Before 1.1.1 the app was called Clip Editor and kept its settings in %APPDATA%\\Clip Editor."""
+    old = SETTINGS_FILE.parent.parent / "Clip Editor"
+    if FROZEN and old.is_dir() and not SETTINGS_FILE.parent.exists():
+        try:
+            old.rename(SETTINGS_FILE.parent)
+        except OSError:
+            pass
+
+
+def load_settings():
+    """{"export": {...last export settings}, "tiktok_after": bool}"""
+    try:
+        s = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(s, dict):
+        return {}
+    return {"export": s} if "preset" in s else s   # 1.0.0 stored the export settings bare
+
+
+def save_settings(s):
+    try:
+        SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        SETTINGS_FILE.write_text(json.dumps(s, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+# ---------------------------------------------------------------- theme
+BG, PANEL, FIELD, BORDER = "#16161a", "#1e1e24", "#2a2a33", "#383844"
+FG, MUTED, ACCENT, ACCENT_H = "#e8e8ee", "#8c8c9a", "#5b8cff", "#7ca3ff"
+HOVER, CANVAS_BG, CUT = "#34343f", "#0e0e11", "#2f4f9e"
+UI_FONT = ("Segoe UI", 10)
+SMALL_FONT = ("Segoe UI", 9)
+# timeline
+HEAD_W, RULER_H, VT_H, AT_H = 116, 24, 58, 44
+EDGE, SNAP_PX = 6, 8
+LANE, HEAD_BG, PLAYHEAD = "#1a1a20", "#25252d", "#ff4d4d"
+CLIP_V, CLIP_V_D, CLIP_A, CLIP_A_D = "#3b5f8f", "#2a4468", "#2f7a55", "#1f553b"
+TICKS = [0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 1800]
+TRACK_MIN_H, TRACK_MAX_H = 24, 160
+# per-clip settings edited in the inspector; stored flat on the clip dict, missing = default
+CLIP_DEFAULTS = {"zoom": 1.0, "pos_x": 0.0, "pos_y": 0.0, "rotation": 0.0, "flip_h": False,
+                 "flip_v": False, "crop_l": 0.0, "crop_r": 0.0, "crop_t": 0.0, "crop_b": 0.0,
+                 "opacity": 100.0, "fade_in": 0.0, "fade_out": 0.0, "volume": 0.0, "pan": 0.0}
+THUMB_H = 72          # height thumbnails are extracted at
+PEAKS_PER_SEC = 100   # waveform resolution
+# glyphs from Segoe Fluent Icons / Segoe MDL2 Assets (built into Windows 10/11)
+ICON = {k: chr(int(v, 16)) for k, v in dict(
+    open="E8E5", add="E710", image="EB9F", video="E714", music="E8D6", cut="E8C6",
+    delete="E74D", ripple="E750", undo="E7A7", redo="E7A6", zin="E8A3", zout="E71F", fit="E9A6",
+    export="E898", vol="E767", mute="E74F", link="E71B", loop="E8EE", play="E768", pause="E769",
+    prev="E892", next="E893", cancel="E711", eye="E7B3", hide="ED1A",
+    send="E724").items()}
+ICON_FONT = "Segoe MDL2 Assets"  # replaced by Segoe Fluent Icons in apply_theme when installed
+
+
+def apply_theme(root):
+    global ICON_FONT
+    if "Segoe Fluent Icons" in tkfont.families(root):
+        ICON_FONT = "Segoe Fluent Icons"
+    st = ttk.Style(root)
+    st.theme_use("clam")
+    root.configure(bg=BG)
+    st.configure(".", background=BG, foreground=FG, fieldbackground=FIELD, bordercolor=BORDER,
+                 lightcolor=BG, darkcolor=BG, troughcolor=FIELD, focuscolor=BG,
+                 selectbackground=ACCENT, selectforeground="white", insertcolor=FG, font=UI_FONT)
+    for name, bg in (("TFrame", BG), ("Panel.TFrame", PANEL)):
+        st.configure(name, background=bg)
+    st.configure("TLabel", background=BG, foreground=FG)
+    st.configure("Panel.TLabel", background=PANEL, foreground=FG)
+    st.configure("Muted.TLabel", background=BG, foreground=MUTED)
+    st.configure("PanelMuted.TLabel", background=PANEL, foreground=MUTED)
+    st.configure("Head.TLabel", background=BG, foreground=ACCENT, font=("Segoe UI Semibold", 10))
+    st.configure("Time.TLabel", background=PANEL, foreground=FG, font=("Consolas", 10))
+
+    st.configure("TButton", background=FIELD, foreground=FG, bordercolor=BORDER, lightcolor=FIELD,
+                 darkcolor=FIELD, padding=(12, 6), relief="flat")
+    st.map("TButton",
+           background=[("disabled", PANEL), ("pressed", BORDER), ("active", HOVER)],
+           lightcolor=[("pressed", BORDER), ("active", HOVER)],
+           darkcolor=[("pressed", BORDER), ("active", HOVER)],
+           bordercolor=[("active", ACCENT)], foreground=[("disabled", MUTED)])
+    st.configure("Accent.TButton", background=ACCENT, foreground="white", bordercolor=ACCENT,
+                 lightcolor=ACCENT, darkcolor=ACCENT, font=("Segoe UI Semibold", 10))
+    st.map("Accent.TButton",
+           background=[("disabled", BORDER), ("pressed", "#4a76e0"), ("active", ACCENT_H)],
+           lightcolor=[("pressed", "#4a76e0"), ("active", ACCENT_H)],
+           darkcolor=[("pressed", "#4a76e0"), ("active", ACCENT_H)],
+           bordercolor=[("active", ACCENT_H)])
+    # compact flat toolbar buttons; ToolOn = toggled on
+    for sty, bg, fg in (("Tool.TButton", PANEL, FG), ("ToolOn.TButton", "#2d3f66", "white"),
+                        ("Bar.TButton", BG, FG)):
+        st.configure(sty, background=bg, foreground=fg, bordercolor=bg, lightcolor=bg,
+                     darkcolor=bg, padding=(7, 3), font=(ICON_FONT, 11))
+        st.map(sty, background=[("disabled", bg), ("pressed", BORDER), ("active", HOVER)],
+               lightcolor=[("pressed", BORDER), ("active", HOVER)],
+               darkcolor=[("pressed", BORDER), ("active", HOVER)],
+               bordercolor=[("active", HOVER)], foreground=[("disabled", MUTED)])
+    for sty in ("ToolText.TButton", "ToolTextOn.TButton"):
+        st.configure(sty, padding=(6, 3), font=SMALL_FONT)
+    st.configure("ToolText.TButton", background=PANEL, bordercolor=PANEL, lightcolor=PANEL,
+                 darkcolor=PANEL)
+    st.configure("ToolTextOn.TButton", background="#2d3f66", foreground="white",
+                 bordercolor="#2d3f66", lightcolor="#2d3f66", darkcolor="#2d3f66")
+    st.configure("PlayTool.TButton", background=ACCENT, foreground="white", bordercolor=ACCENT,
+                 lightcolor=ACCENT, darkcolor=ACCENT, padding=(10, 3), font=(ICON_FONT, 11))
+    st.map("PlayTool.TButton", background=[("active", ACCENT_H)], lightcolor=[("active", ACCENT_H)],
+           darkcolor=[("active", ACCENT_H)], bordercolor=[("active", ACCENT_H)])
+    st.configure("Small.Accent.TButton", padding=(12, 3))
+    for sty in ("Tool.TButton", "ToolOn.TButton", "Bar.TButton", "ToolText.TButton",
+                "ToolTextOn.TButton", "PlayTool.TButton"):
+        st.configure(sty, width=0)
+    st.configure("Bar.TFrame", background=BG)
+    st.configure("Small.TCombobox", padding=2)
+    st.configure("Small.TEntry", padding=3)
+
+    st.configure("TCombobox", fieldbackground=FIELD, background=FIELD, foreground=FG, arrowcolor=FG,
+                 bordercolor=BORDER, lightcolor=FIELD, darkcolor=FIELD, padding=4)
+    st.map("TCombobox", fieldbackground=[("readonly", FIELD), ("disabled", PANEL)],
+           foreground=[("readonly", FG), ("disabled", MUTED)],
+           selectbackground=[("readonly", FIELD)], selectforeground=[("readonly", FG)],
+           bordercolor=[("focus", ACCENT), ("hover", ACCENT)], background=[("active", HOVER)])
+    root.option_add("*TCombobox*Listbox.background", FIELD)
+    root.option_add("*TCombobox*Listbox.foreground", FG)
+    root.option_add("*TCombobox*Listbox.selectBackground", ACCENT)
+    root.option_add("*TCombobox*Listbox.selectForeground", "white")
+    root.option_add("*TCombobox*Listbox.font", UI_FONT)
+    root.option_add("*TCombobox*Listbox.borderWidth", 0)
+
+    st.configure("TEntry", fieldbackground=FIELD, foreground=FG, bordercolor=BORDER,
+                 lightcolor=FIELD, darkcolor=FIELD, padding=5, insertcolor=FG)
+    st.map("TEntry", bordercolor=[("focus", ACCENT)], fieldbackground=[("disabled", PANEL)],
+           foreground=[("disabled", MUTED)])
+    for sty, bg in (("Horizontal.TScale", BG), ("Panel.Horizontal.TScale", PANEL)):
+        st.configure(sty, background=ACCENT, troughcolor=FIELD, bordercolor=bg,
+                     lightcolor=ACCENT, darkcolor=ACCENT, gripcount=0, sliderthickness=14)
+        st.map(sty, background=[("active", ACCENT_H)])
+    st.configure("Horizontal.TProgressbar", background=ACCENT, troughcolor=FIELD, bordercolor=PANEL,
+                 lightcolor=ACCENT, darkcolor=ACCENT, thickness=8)
+    for sty, bg in (("TCheckbutton", BG), ("Panel.TCheckbutton", PANEL),
+                    ("TRadiobutton", BG)):
+        st.configure(sty, background=bg, foreground=FG, indicatorbackground=FIELD,
+                     indicatorforeground="white", upperbordercolor=BORDER, lowerbordercolor=BORDER)
+        st.map(sty, background=[("active", bg)],
+               indicatorbackground=[("selected", ACCENT), ("active", HOVER)])
+    st.configure("TSeparator", background=BORDER)
+    for sty in ("Horizontal.TScrollbar", "Vertical.TScrollbar"):
+        st.configure(sty, background=FIELD, troughcolor=PANEL, bordercolor=PANEL,
+                     lightcolor=FIELD, darkcolor=FIELD, arrowcolor=FG)
+        st.map(sty, background=[("active", HOVER)])
+
+
+def dark_titlebar(win):
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        win.update_idletasks()
+        hwnd = ctypes.windll.user32.GetParent(win.winfo_id())
+        val = ctypes.c_int(1)
+        for attr in (20, 19):
+            if ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                    hwnd, attr, ctypes.byref(val), ctypes.sizeof(val)) == 0:
+                break
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------- ffmpeg helpers
+def cp(clip, key):
+    return clip.get(key, CLIP_DEFAULTS[key])
+
+
+def fmt_time(t):
+    m, s = divmod(max(t, 0), 60)
+    h, m = divmod(int(m), 60)
+    return f"{h}:{m:02d}:{s:05.2f}" if h else f"{m}:{s:05.2f}"
+
+
+def probe(path):
+    """Returns {"dur", "fps", "audio", "video", "size"}."""
+    r = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries",
+         "format=duration:stream=codec_type,avg_frame_rate,r_frame_rate,width,height",
+         "-of", "json", path],
+        capture_output=True, text=True, creationflags=NOWIN)
+    try:
+        info = json.loads(r.stdout)
+    except ValueError:
+        return {"dur": 0.0, "fps": 30.0, "audio": False, "video": False}
+    try:
+        dur = float(info.get("format", {}).get("duration") or 0)
+    except ValueError:
+        dur = 0.0
+    fps, audio, got_video, size = 30.0, False, False, None
+    for s in info.get("streams", []):
+        if s.get("codec_type") == "audio":
+            audio = True
+        elif s.get("codec_type") == "video" and not got_video:
+            got_video = True
+            if s.get("width") and s.get("height"):
+                size = (int(s["width"]), int(s["height"]))
+            for key in ("avg_frame_rate", "r_frame_rate"):
+                n, _, d = (s.get(key) or "0/0").partition("/")
+                try:
+                    v = float(n) / float(d or 1)
+                except (ValueError, ZeroDivisionError):
+                    continue
+                if 1 < v <= 240:
+                    fps = v
+                    break
+    return {"dur": dur, "fps": fps, "audio": audio, "video": got_video, "size": size}
+
+
+def read_media(path):
+    """Media info for the timeline, or None if FFmpeg can't use it. Safe to call from a thread."""
+    if Path(path).suffix.lower() in IMAGE_EXT:
+        try:
+            with Image.open(path) as im:
+                size = im.size
+        except OSError:
+            return None
+        return {"dur": 0.0, "fps": 30.0, "audio": False, "video": True, "image": True, "size": size}
+    info = probe(path)
+    if info["dur"] > 0 and (info["video"] or info["audio"]):
+        return dict(info, image=False)
+    return None
+
+
+def extract_thumbs(path, m):
+    """(seconds per thumbnail, [images THUMB_H high]) for a clip's filmstrip; step 0 = a still."""
+    if m["image"]:
+        try:
+            with Image.open(path) as im:
+                im = im.convert("RGB")
+                im.thumbnail((THUMB_H * 4, THUMB_H))
+                return 0, [im]
+        except OSError:
+            return 0, []
+    step = max(0.25, m["dur"] / 240)
+    # long files: decode keyframes only, which is many times faster
+    cmd = (["ffmpeg", "-v", "error"] + (["-skip_frame", "nokey"] if m["dur"] > 120 else []) +
+           ["-i", path, "-an", "-vf", f"fps=1/{step:.4f},scale=-2:{THUMB_H}",
+            "-f", "image2pipe", "-c:v", "bmp", "-"])
+    out = subprocess.run(cmd, capture_output=True, creationflags=NOWIN).stdout
+    imgs, i = [], 0
+    while i + 6 <= len(out):   # concatenated BMPs; each header holds its own size
+        size = int.from_bytes(out[i + 2:i + 6], "little")
+        if size <= 0:
+            break
+        try:
+            imgs.append(Image.open(BytesIO(out[i:i + size])).convert("RGB"))
+        except OSError:
+            break
+        i += size
+    return step, imgs
+
+
+def extract_peaks(path):
+    """Waveform: loudest sample per 1/PEAKS_PER_SEC s, 0-255."""
+    rate = 8000
+    raw = subprocess.run(["ffmpeg", "-v", "error", "-i", path, "-vn", "-ac", "1", "-ar", str(rate),
+                          "-f", "s16le", "-"], capture_output=True, creationflags=NOWIN).stdout
+    a = array("h")
+    a.frombytes(raw[:len(raw) // 2 * 2])
+    n = rate // PEAKS_PER_SEC
+    return bytes(min(255, max(-min(a[i:i + n]), max(a[i:i + n])) * 255 // 32767)
+                 for i in range(0, len(a) - n + 1, n))
+
+
+def grab_frame(path, t):
+    cmd = ["ffmpeg", "-v", "error", "-ss", f"{t:.3f}", "-i", path, "-frames:v", "1",
+           "-f", "image2pipe", "-c:v", "bmp", "-"]
+    return run_bmp(cmd)
+
+
+def run_bmp(cmd):
+    out = subprocess.run(cmd, capture_output=True, creationflags=NOWIN).stdout
+    if not out:
+        return None
+    return Image.open(BytesIO(out)).convert("RGB")
+
+
+def parse_size(text):
+    text = text.strip().lower()
+    if not text:
+        return None
+    w, h = (int(v) for v in text.split("x"))
+    if w < 16 or h < 16:
+        raise ValueError
+    return w // 2 * 2, h // 2 * 2
+
+
+def media_info(path):
+    """Returns {"w", "h", "dur", "vcodec", "acodec"} of a finished video."""
+    r = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries",
+         "format=duration:stream=codec_type,codec_name,width,height", "-of", "json", path],
+        capture_output=True, text=True, creationflags=NOWIN)
+    info = {"w": 0, "h": 0, "dur": 0.0, "vcodec": None, "acodec": None}
+    try:
+        j = json.loads(r.stdout)
+        info["dur"] = float(j.get("format", {}).get("duration") or 0)
+    except ValueError:
+        return info
+    for s in j.get("streams", []):
+        if s.get("codec_type") == "video" and not info["vcodec"]:
+            info.update(w=int(s.get("width") or 0), h=int(s.get("height") or 0),
+                        vcodec=s.get("codec_name"))
+        elif s.get("codec_type") == "audio" and not info["acodec"]:
+            info["acodec"] = s.get("codec_name")
+    return info
+
+
+# ---------------------------------------------------------------- on-video text
+TEXT_STYLES = ["Outline", "Box", "Soft box", "Plain"]
+TEXT_COLORS = {"White": "#ffffff", "Black": "#121212", "Yellow": "#ffd23f", "Red": "#fe2c55",
+               "Cyan": "#25f4ee", "Green": "#3ddc84", "Orange": "#ff8a00", "Pink": "#ff6fb5"}
+_fonts = {}
+
+
+def text_font(px):
+    if px not in _fonts:
+        for f in (FONT_FILE, "segoeuib.ttf", "arialbd.ttf"):
+            try:
+                _fonts[px] = ImageFont.truetype(str(f), px)
+                break
+            except OSError:
+                continue
+        else:
+            _fonts[px] = ImageFont.load_default()
+    return _fonts[px]
+
+
+def render_text(item, frame_w):
+    """TikTok-style text block as an RGBA image sized for a frame frame_w pixels wide.
+    item: {"text", "style", "color", "size" (% of frame width)}."""
+    px = max(8, int(frame_w * item["size"] / 100))
+    font = text_font(px)
+    lines = item["text"].split("\n")
+    rgb = Image.new("RGB", (1, 1), TEXT_COLORS.get(item["color"], "#ffffff")).getpixel((0, 0))
+    light = (0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]) > 150
+    style = item["style"]
+    stroke = max(2, px // 11) if style == "Outline" else 0
+    boxed = style in ("Box", "Soft box")
+    padx, pady = (int(px * 0.32), int(px * 0.12)) if boxed else (0, 0)
+    asc, desc = font.getmetrics()
+    lh = asc + desc + 2 * pady
+    widths = [font.getlength(l) for l in lines]
+    m = stroke + px // 6   # room for outline and shadow
+    W = int(max(widths) + 2 * padx) + 2 * m
+    H = lh * len(lines) + 2 * m
+    img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    if style == "Plain":   # soft drop shadow
+        sh = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        d = ImageDraw.Draw(sh)
+        for i, line in enumerate(lines):
+            d.text(((W - widths[i]) / 2, m + i * lh + px // 20), line, font=font,
+                   fill=(0, 0, 0, 170))
+        img = Image.alpha_composite(img, sh.filter(ImageFilter.GaussianBlur(px / 14)))
+    d = ImageDraw.Draw(img)
+    for i, line in enumerate(lines):
+        x, y = (W - widths[i]) / 2, m + i * lh
+        if boxed and line.strip():
+            fill = rgb + (255,) if style == "Box" else (0, 0, 0, 150)
+            d.rounded_rectangle((x - padx, y, x + widths[i] + padx, y + lh),
+                                radius=int(px * 0.28), fill=fill)
+        if style == "Box":
+            fg = (18, 18, 18) if light else (255, 255, 255)
+        else:
+            fg = rgb
+        dark = (0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]) < 50
+        outline = (255, 255, 255) if dark else (0, 0, 0)
+        d.text((x, y + pady), line, font=font, fill=fg, stroke_width=stroke, stroke_fill=outline)
+    return img
+
+
+# ---------------------------------------------------------------- encoders
+# label, ffmpeg encoder, family, codec kind
+CODECS = [
+    ("H.264  (CPU, x264)", "libx264", "x26x", "h264"),
+    ("H.265 / HEVC  (CPU, x265)", "libx265", "x26x", "hevc"),
+    ("AV1  (CPU, SVT-AV1)", "libsvtav1", "svtav1", "av1"),
+    ("VP9  (CPU)", "libvpx-vp9", "vp9", "vp9"),
+    ("H.264  (AMD GPU)", "h264_amf", "amf", "h264"),
+    ("H.265  (AMD GPU)", "hevc_amf", "amf", "hevc"),
+    ("AV1  (AMD GPU)", "av1_amf", "amf", "av1"),
+    ("H.264  (NVIDIA GPU)", "h264_nvenc", "nvenc", "h264"),
+    ("H.265  (NVIDIA GPU)", "hevc_nvenc", "nvenc", "hevc"),
+    ("AV1  (NVIDIA GPU)", "av1_nvenc", "nvenc", "av1"),
+    ("H.264  (Intel GPU)", "h264_qsv", "qsv", "h264"),
+    ("H.265  (Intel GPU)", "hevc_qsv", "qsv", "hevc"),
+]
+HW_FAMILIES = {"amf", "nvenc", "qsv"}
+# (best, worst) quality value per encoder or family
+QRANGE = {"libx264": (14, 34), "libx265": (16, 36), "libsvtav1": (18, 52),
+          "libvpx-vp9": (15, 50), "amf": (14, 38), "nvenc": (16, 40), "qsv": (16, 40)}
+QNAME = {"x26x": "CRF", "svtav1": "CRF", "vp9": "CRF", "amf": "QP", "nvenc": "CQ", "qsv": "ICQ"}
+CONTAINERS = {"mp4": {"h264", "hevc", "av1", "vp9"}, "mkv": {"h264", "hevc", "av1", "vp9"},
+              "mov": {"h264", "hevc"}, "webm": {"vp9", "av1"}}
+AUDIO = {"AAC": "aac", "Opus": "opus", "No audio": "none"}
+AUDIO_OK = {"mp4": {"aac", "opus", "none"}, "mkv": {"aac", "opus", "none"},
+            "mov": {"aac", "none"}, "webm": {"opus", "none"}}
+SPEEDS = ["Fast", "Balanced", "Slow (smaller file)"]
+FPS_OPTS = ["Source", "24", "25", "30", "50", "60"]
+AUDIO_BR = ["96", "128", "160", "192", "256", "320"]
+
+
+def detect_encoders():
+    """Returns (usable video codecs, opus encoder name or None)."""
+    try:
+        out = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"], capture_output=True,
+                             text=True, creationflags=NOWIN).stdout
+    except OSError:
+        return [], None
+    names = {m.group(2) for m in re.finditer(r"^\s*([VA])[\w.]{5}\s+(\S+)", out, re.M)}
+    found = [c for c in CODECS if c[1] in names]
+
+    def works(c):
+        pix = "nv12" if c[2] == "qsv" else "yuv420p"
+        try:
+            r = subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i",
+                                "color=black:s=320x240:d=0.2", "-frames:v", "3", "-pix_fmt", pix,
+                                "-c:v", c[1], "-f", "null", "-"],
+                               capture_output=True, creationflags=NOWIN, timeout=25)
+            return r.returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+
+    hw = [c for c in found if c[2] in HW_FAMILIES]
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        ok = dict(zip([c[1] for c in hw], ex.map(works, hw)))
+    usable = [c for c in found if c[2] not in HW_FAMILIES or ok.get(c[1])]
+    opus = "libopus" if "libopus" in names else ("opus" if "opus" in names else None)
+    return usable, opus
+
+
+def quality_value(codec, quality):
+    lo, hi = QRANGE.get(codec[1], QRANGE.get(codec[2], (18, 34)))
+    return round(lo + (hi - lo) * (1 - quality / 100))
+
+
+def video_args(codec, speed, mode, quality, kbps, container):
+    _, enc, fam, kind = codec
+    q = quality_value(codec, quality)
+    a = ["-c:v", enc]
+    if fam == "x26x":
+        a += ["-preset", ["veryfast", "medium", "slow"][speed]]
+    elif fam == "svtav1":
+        a += ["-preset", ["10", "8", "6"][speed]]
+    elif fam == "vp9":
+        a += ["-deadline", "good", "-cpu-used", ["5", "3", "1"][speed], "-row-mt", "1"]
+    elif fam == "amf":
+        a += ["-quality", ["speed", "balanced", "quality"][speed]]
+    elif fam == "nvenc":
+        a += ["-preset", ["p2", "p5", "p7"][speed]]
+    elif fam == "qsv":
+        a += ["-preset", ["veryfast", "medium", "slower"][speed]]
+
+    if mode == "quality":
+        if fam in ("x26x", "svtav1"):
+            a += ["-crf", str(q)]
+        elif fam == "vp9":
+            a += ["-crf", str(q), "-b:v", "0"]
+        elif fam == "amf":
+            a += ["-rc", "cqp", "-qp_i", str(q), "-qp_p", str(q)]
+        elif fam == "nvenc":
+            a += ["-rc", "vbr", "-cq", str(q), "-b:v", "0"]
+        elif fam == "qsv":
+            a += ["-global_quality", str(q)]
+    else:
+        k = max(100, int(kbps))
+        a += ["-b:v", f"{k}k"]
+        if fam != "svtav1":
+            a += ["-maxrate", f"{int(k * 1.5)}k", "-bufsize", f"{k * 2}k"]
+        if fam == "amf":
+            a += ["-rc", "vbr_peak"]
+        elif fam == "nvenc":
+            a += ["-rc", "vbr"]
+
+    a += ["-pix_fmt", "nv12" if fam == "qsv" else "yuv420p"]
+    if kind == "hevc" and container in ("mp4", "mov"):
+        a += ["-tag:v", "hvc1"]
+    if enc == "libx265":
+        a += ["-x265-params", "log-level=error"]
+    return a
+
+
+def audio_args(audio, abr, opus_enc):
+    if audio == "none":
+        return ["-an"]
+    if audio == "opus":
+        a = ["-c:a", opus_enc or "libopus", "-b:a", f"{abr}k"]
+        return a + (["-strict", "-2"] if opus_enc == "opus" else [])
+    return ["-c:a", "aac", "-b:a", f"{abr}k"]
+
+
+# ---------------------------------------------------------------- playback
+class Player:
+    """Reads raw RGB frames from an ffmpeg command in a thread.
+    Sound: a second ffmpeg mixes the audio to WAV and pipes it into ffplay."""
+
+    def __init__(self, vcmd, acmd, size, fps, volume=100):
+        self.w, self.h = size
+        self.fps = fps
+        self.stopped = False
+        self.frames = queue.Queue(maxsize=8)
+        self.proc = subprocess.Popen(vcmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                     stdin=subprocess.DEVNULL, creationflags=NOWIN)
+        self.feed = self.sound = None
+        self.set_sound(acmd, volume)
+        threading.Thread(target=self._read, daemon=True).start()
+
+    def set_sound(self, acmd, volume):
+        """(Re)starts the sound; used for a volume change while the picture keeps playing."""
+        for p in (self.feed, self.sound):
+            if p:
+                try:
+                    p.kill()
+                except OSError:
+                    pass
+        self.feed = self.sound = None
+        if acmd and volume >= 1 and shutil.which("ffplay"):
+            self.feed = subprocess.Popen(acmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                         stdin=subprocess.DEVNULL, creationflags=NOWIN)
+            self.sound = subprocess.Popen(
+                ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet",
+                 "-volume", str(int(min(max(volume, 0), 100))), "-i", "-"],
+                stdin=self.feed.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=NOWIN)
+            self.feed.stdout.close()
+
+    def _put(self, item):
+        while not self.stopped:
+            try:
+                self.frames.put(item, timeout=0.1)
+                return
+            except queue.Full:
+                pass
+
+    def _read(self):
+        n = self.w * self.h * 3
+        while not self.stopped:
+            buf = self.proc.stdout.read(n)
+            if len(buf) < n:
+                break
+            self._put(buf)
+        self._put(None)
+
+    def stop(self):
+        self.stopped = True
+        for p in (self.proc, self.feed, self.sound):
+            if p:
+                try:
+                    p.kill()
+                except OSError:
+                    pass
+
+
+# ---------------------------------------------------------------- export dialog
+class ExportDialog(tk.Toplevel):
+    def __init__(self, app):
+        super().__init__(app.root)
+        self.app = app
+        self.title("Export")
+        self.configure(bg=BG)
+        self.resizable(False, False)
+        self.transient(app.root)
+        self.codecs = app.codecs or [CODECS[0]]
+        self.by_label = {c[0]: c for c in self.codecs}
+        self.by_enc = {c[1]: c for c in self.codecs}
+        self.applying = False
+
+        s = app.exp_settings
+        self.v = {
+            "preset": tk.StringVar(value=s.get("preset", "Balanced")),
+            "container": tk.StringVar(value=s.get("container", "mp4")),
+            "codec": tk.StringVar(value=self.label_for(s.get("codec", "libx264"))),
+            "speed": tk.StringVar(value=SPEEDS[s.get("speed", 1)]),
+            "mode": tk.StringVar(value=s.get("mode", "quality")),
+            "quality": tk.DoubleVar(value=s.get("quality", 70)),
+            "target": tk.StringVar(value=s.get("target", "9.5")),
+            "fps": tk.StringVar(value=s.get("fps", "Source")),
+            "audio": tk.StringVar(value=s.get("audio", "AAC")),
+            "abr": tk.StringVar(value=s.get("abr", "192")),
+        }
+
+        body = ttk.Frame(self, padding=18)
+        body.pack(fill="both")
+        body.columnconfigure(1, weight=1)
+        r = 0
+
+        def head(text):
+            nonlocal r
+            ttk.Label(body, text=text, style="Head.TLabel").grid(
+                row=r, column=0, columnspan=3, sticky="w", pady=(12 if r else 0, 4))
+            r += 1
+
+        def row(label, widget, extra=None):
+            nonlocal r
+            ttk.Label(body, text=label).grid(row=r, column=0, sticky="w", padx=(0, 14), pady=4)
+            widget.grid(row=r, column=1, sticky="ew", pady=4)
+            if extra:
+                extra.grid(row=r, column=2, sticky="w", padx=(8, 0))
+            r += 1
+
+        def combo(var, values, width=30):
+            return ttk.Combobox(body, textvariable=var, values=values, state="readonly", width=width)
+
+        head("Preset")
+        row("Preset", combo(self.v["preset"], list(self.presets()) + ["Custom"]))
+
+        head("Video")
+        row("Format", combo(self.v["container"], list(CONTAINERS)))
+        self.codec_cb = combo(self.v["codec"], [])
+        row("Codec", self.codec_cb)
+        row("Encoder speed", combo(self.v["speed"], SPEEDS))
+        modes = ttk.Frame(body)
+        ttk.Radiobutton(modes, text="Constant quality", value="quality",
+                        variable=self.v["mode"], takefocus=False).pack(side="left")
+        ttk.Radiobutton(modes, text="Target file size", value="size",
+                        variable=self.v["mode"], takefocus=False).pack(side="left", padx=(14, 0))
+        row("Rate control", modes)
+        self.q_scale = ttk.Scale(body, from_=0, to=100, variable=self.v["quality"], takefocus=False)
+        self.q_lbl = ttk.Label(body, style="Muted.TLabel", width=16)
+        row("Quality", self.q_scale, self.q_lbl)
+        self.size_entry = ttk.Entry(body, textvariable=self.v["target"], width=10)
+        row("Target size", self.size_entry, ttk.Label(body, text="MB", style="Muted.TLabel"))
+        row("Frame rate", combo(self.v["fps"], FPS_OPTS))
+
+        head("Audio")
+        self.audio_cb = combo(self.v["audio"], [])
+        row("Audio codec", self.audio_cb)
+        self.abr_cb = combo(self.v["abr"], AUDIO_BR)
+        row("Bitrate", self.abr_cb, ttk.Label(body, text="kbps", style="Muted.TLabel"))
+
+        self.tiktok_after = tk.BooleanVar(value=app.settings.get("tiktok_after", False))
+        ttk.Checkbutton(body, text="Open Post to TikTok after export", variable=self.tiktok_after,
+                        takefocus=False).grid(row=r, column=0, columnspan=3, sticky="w", pady=(12, 0))
+        r += 1
+
+        ttk.Separator(body).grid(row=r, column=0, columnspan=3, sticky="ew", pady=(14, 8))
+        r += 1
+        self.summary = ttk.Label(body, style="Muted.TLabel", justify="left")
+        self.summary.grid(row=r, column=0, columnspan=3, sticky="w")
+        r += 1
+
+        btns = ttk.Frame(body)
+        btns.grid(row=r, column=0, columnspan=3, sticky="e", pady=(16, 0))
+        ttk.Button(btns, text="Cancel", command=self.destroy, takefocus=False).pack(side="left")
+        ttk.Button(btns, text="Export", style="Accent.TButton", command=self.go,
+                   takefocus=False).pack(side="left", padx=(8, 0))
+
+        self.v["preset"].trace_add("write", lambda *a: self.apply_preset())
+        self.v["container"].trace_add("write", lambda *a: self.refresh())
+        for k in ("codec", "speed", "mode", "quality", "target", "fps", "audio", "abr"):
+            self.v[k].trace_add("write", lambda *a: self.changed())
+        self.refresh()
+
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.bind("<Return>", lambda e: self.go())
+        dark_titlebar(self)
+        self.update_idletasks()
+        x = app.root.winfo_rootx() + (app.root.winfo_width() - self.winfo_width()) // 2
+        y = app.root.winfo_rooty() + (app.root.winfo_height() - self.winfo_height()) // 3
+        self.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        self.grab_set()
+
+    def label_for(self, enc):
+        c = self.by_enc.get(enc)
+        return c[0] if c else self.codecs[0][0]
+
+    def presets(self):
+        x265 = "libx265" if "libx265" in self.by_enc else "libx264"
+        p = {
+            "High quality": dict(container="mp4", codec="libx264", speed=2, mode="quality",
+                                 quality=85, fps="Source", audio="AAC", abr="256"),
+            "Balanced": dict(container="mp4", codec="libx264", speed=1, mode="quality",
+                             quality=70, fps="Source", audio="AAC", abr="192"),
+            "Small file": dict(container="mp4", codec=x265, speed=1, mode="quality",
+                               quality=50, fps="Source", audio="AAC", abr="128"),
+            "Discord (under 10 MB)": dict(container="mp4", codec="libx264", speed=1, mode="size",
+                                          target="9.5", fps="30", audio="AAC", abr="96"),
+        }
+        gpu = next((c for fam in ("amf", "nvenc", "qsv") for c in self.codecs
+                    if c[2] == fam and c[3] == "h264"), None)
+        if gpu:
+            p["Fast export (GPU)"] = dict(container="mp4", codec=gpu[1], speed=1, mode="quality",
+                                          quality=72, fps="Source", audio="AAC", abr="192")
+        return p
+
+    def apply_preset(self):
+        p = self.presets().get(self.v["preset"].get())
+        if not p:
+            return
+        self.applying = True
+        for k, val in p.items():
+            if k == "codec":
+                val = self.label_for(val)
+            elif k == "speed":
+                val = SPEEDS[val]
+            self.v[k].set(val)
+        self.applying = False
+        self.refresh()
+
+    def changed(self):
+        if not self.applying and self.v["preset"].get() != "Custom":
+            self.applying = True
+            self.v["preset"].set("Custom")
+            self.applying = False
+        self.update_labels()
+
+    def refresh(self):
+        cont = self.v["container"].get()
+        codecs = [c[0] for c in self.codecs if c[3] in CONTAINERS[cont]]
+        self.codec_cb.config(values=codecs)
+        auds = [k for k, v in AUDIO.items() if v in AUDIO_OK[cont]
+                and not (v == "opus" and not self.app.opus_enc)
+                and not (v != "none" and not self.app.any_audio())]
+        self.audio_cb.config(values=auds)
+        was = self.applying
+        self.applying = True
+        if codecs and self.v["codec"].get() not in codecs:
+            self.v["codec"].set(codecs[0])
+        if self.v["audio"].get() not in auds:
+            self.v["audio"].set(auds[0])
+        self.applying = was
+        self.update_labels()
+
+    def update_labels(self):
+        codec = self.by_label.get(self.v["codec"].get(), self.codecs[0])
+        size_mode = self.v["mode"].get() == "size"
+        self.q_scale.state(["disabled"] if size_mode else ["!disabled"])
+        self.size_entry.state(["!disabled"] if size_mode else ["disabled"])
+        q = self.v["quality"].get()
+        self.q_lbl.config(text=f"{q:.0f}%   {QNAME[codec[2]]} {quality_value(codec, q)}")
+        aud = AUDIO.get(self.v["audio"].get(), "none")
+        self.abr_cb.state(["disabled"] if aud == "none" else ["!disabled", "readonly"])
+
+        ow, oh = self.app.output_dims()
+        length = self.app.render_len()
+        lines = f"Output  {ow} x {oh}   ·   length {fmt_time(length)}   ·   .{self.v['container'].get()}"
+        if size_mode:
+            kb = self.video_kbps()
+            lines += (f"\nVideo bitrate about {kb} kbps" if kb and kb >= 100
+                      else "\nTarget size is too small for this length")
+        if codec[2] in HW_FAMILIES:
+            lines += "\nGPU encoding: much faster, slightly bigger files at the same quality"
+        self.summary.config(text=lines)
+
+    def video_kbps(self):
+        try:
+            mb = float(self.v["target"].get().replace(",", "."))
+        except ValueError:
+            return None
+        length = max(self.app.render_len(), 0.1)
+        aud = AUDIO.get(self.v["audio"].get(), "none")
+        a_kbps = 0 if aud == "none" else int(self.v["abr"].get())
+        return int(mb * 8192 / length * 0.94 - a_kbps)
+
+    def go(self):
+        size_mode = self.v["mode"].get() == "size"
+        kbps = self.video_kbps() if size_mode else 0
+        if size_mode and (not kbps or kbps < 100):
+            messagebox.showerror("Export", "That target size is too small for this clip length.",
+                                 parent=self)
+            return
+        codec = self.by_label.get(self.v["codec"].get(), self.codecs[0])
+        settings = {
+            "preset": self.v["preset"].get(), "container": self.v["container"].get(),
+            "codec": codec[1], "speed": SPEEDS.index(self.v["speed"].get()),
+            "mode": self.v["mode"].get(), "quality": round(self.v["quality"].get()),
+            "target": self.v["target"].get(), "fps": self.v["fps"].get(),
+            "audio": self.v["audio"].get(), "abr": self.v["abr"].get(),
+        }
+        ext = settings["container"]
+        first = Path(min(self.app.clips, key=lambda c: c["start"])["path"])
+        out = filedialog.asksaveasfilename(
+            parent=self, defaultextension=f".{ext}",
+            initialdir=self.app.last_dir or str(first.parent),
+            initialfile=f"{first.stem}_edited.{ext}",
+            filetypes=[(ext.upper(), f"*.{ext}")])
+        if not out:
+            return
+        self.app.exp_settings = settings
+        self.app.settings.update(export=settings, tiktok_after=self.tiktok_after.get())
+        save_settings(self.app.settings)
+        self.destroy()
+        self.app.start_export(out, settings, codec, kbps)
+
+
+# ---------------------------------------------------------------- TikTok
+PRIVACY_NAMES = {"PUBLIC_TO_EVERYONE": "Everyone", "MUTUAL_FOLLOW_FRIENDS": "Friends",
+                 "FOLLOWER_OF_CREATOR": "Followers", "SELF_ONLY": "Only me"}
+TIKTOK_CODECS = {"h264", "hevc", "vp8", "vp9"}
+# left, top, right, bottom share of the frame that TikTok's buttons and caption cover on a phone
+SAFE_ZONE = (0.06, 0.08, 0.14, 0.22)
+CAPTION_MAX = 2200
+
+
+def popup_center(win, parent):
+    win.update_idletasks()
+    x = parent.winfo_rootx() + (parent.winfo_width() - win.winfo_width()) // 2
+    y = parent.winfo_rooty() + (parent.winfo_height() - win.winfo_height()) // 3
+    win.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+
+
+def link_label(parent, text, url, bg=BG):
+    lbl = tk.Label(parent, text=text, fg=ACCENT, bg=bg, cursor="hand2",
+                   font=(SMALL_FONT[0], SMALL_FONT[1], "underline"))
+    lbl.bind("<Button-1>", lambda e: tiktok_api.open_url(url))
+    return lbl
+
+
+def parse_secs(text):
+    """'12.5' or '0:12.5' -> seconds, None if invalid."""
+    try:
+        m, _, s = text.strip().rpartition(":")
+        return (int(m) * 60 if m else 0) + float(s.replace(",", "."))
+    except ValueError:
+        return None
+
+
+class KeysDialog(tk.Toplevel):
+    """Client key and secret of the user's own TikTok developer app."""
+
+    def __init__(self, parent, tt, on_save):
+        super().__init__(parent)
+        self.tt, self.on_save = tt, on_save
+        self.title("TikTok developer keys")
+        self.configure(bg=BG)
+        self.resizable(False, False)
+        self.transient(parent)
+        body = ttk.Frame(self, padding=18)
+        body.pack(fill="both")
+        ttk.Label(body, text="Link q-edit to your TikTok developer app",
+                  style="Head.TLabel").pack(anchor="w")
+        steps = ("1.  Sign in at developers.tiktok.com and create an app.\n"
+                 "2.  Add Login Kit, platform Desktop, with this redirect URI:\n"
+                 f"        {tiktok_api.REDIRECT_HELP}\n"
+                 "3.  Add Content Posting API and turn on Direct Post.\n"
+                 "4.  Paste the app's Client key and Client secret below.\n\n"
+                 "Until TikTok reviews your app, posts are private (Only me) and the\n"
+                 "account has to be set to private while posting.")
+        ttk.Label(body, text=steps, justify="left").pack(anchor="w", pady=(6, 8))
+        link_label(body, "Open the TikTok developer portal", tiktok_api.PORTAL).pack(
+            anchor="w", pady=(0, 10))
+        form = ttk.Frame(body)
+        form.pack(fill="x")
+        self.key = tk.StringVar(value=tt.data.get("client_key", ""))
+        self.secret = tk.StringVar(value=tt.data.get("client_secret", ""))
+        for i, (label, var, show) in enumerate((("Client key", self.key, ""),
+                                                ("Client secret", self.secret, "•"))):
+            ttk.Label(form, text=label).grid(row=i, column=0, sticky="w", padx=(0, 12), pady=4)
+            ttk.Entry(form, textvariable=var, width=46, show=show).grid(row=i, column=1, pady=4)
+        btns = ttk.Frame(body)
+        btns.pack(anchor="e", pady=(14, 0))
+        ttk.Button(btns, text="Cancel", command=self.destroy, takefocus=False).pack(side="left")
+        ttk.Button(btns, text="Save", style="Accent.TButton", command=self.save,
+                   takefocus=False).pack(side="left", padx=(8, 0))
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.bind("<Return>", lambda e: self.save())
+        dark_titlebar(self)
+        popup_center(self, parent)
+        self.grab_set()
+
+    def save(self):
+        key, secret = self.key.get().strip(), self.secret.get().strip()
+        if not (key and secret):
+            messagebox.showerror("TikTok", "Paste both the Client key and the Client secret.",
+                                 parent=self)
+            return
+        self.tt.set_keys(key, secret)
+        self.destroy()
+        self.on_save()
+
+
+class TikTokPanel(tk.Toplevel):
+    """Posts a finished video to the linked TikTok account with a caption, a cover and on-video
+    text. Text and an own cover image are burned in with one extra encode right before upload."""
+
+    def __init__(self, app, path):
+        super().__init__(app.root)
+        self.app, self.path, self.tt = app, path, app.tiktok
+        self.title(f"Post to TikTok  ·  {Path(path).name}")
+        self.configure(bg=BG)
+        self.geometry("1120x840")
+        self.minsize(980, 780)
+        self.q = queue.Queue()
+        self.info = media_info(path)
+        self.vw, self.vh = self.info["w"] or 1080, self.info["h"] or 1920
+        self.dur = max(self.info["dur"], 0.1)
+        # caption, text and cover survive closing the panel (until the app quits)
+        self.state = app.tt_state
+        self.texts = self.state.setdefault("texts", [])
+        for it in self.texts:
+            it["end"] = min(it["end"], self.dur)
+            it["start"] = min(it["start"], it["end"])
+        self.sel = None
+        self.t = 0.0
+        self.cover_t = min(self.state.get("cover_t", 0.0), self.dur)
+        self.cover_pil = None
+        self.frame = self.frame_photo = self.frame_key = None
+        self.frame_req, self.frame_job = 0, None
+        self.photos = {}
+        self.hitboxes = []
+        self.geo = (1.0, 1, 1, 0, 0)
+        self.drag = None
+        self.creator = None
+        self.job = None          # threading.Event of the running login / post (set = cancel)
+        self.loading = False
+        self.closed = False
+
+        self.build()
+        self.caption.insert("1.0", self.state.get("caption", ""))
+        self.update_count()
+        if self.state.get("cover_img"):
+            self.set_cover_image(self.state["cover_img"])
+        self.cover_mode.set(self.state.get("cover_mode", "frame"))
+        self.select_text(None)
+        self.refresh_account()
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        dark_titlebar(self)
+        self.after(40, self.poll)
+        self.after(100, self.fetch_frame)
+
+    # ---------- layout ----------
+    def build(self):
+        right = ttk.Frame(self, padding=(8, 10, 14, 12), width=380)
+        right.pack(side="right", fill="y")
+        right.pack_propagate(False)
+        left = ttk.Frame(self, padding=(12, 10, 6, 12))
+        left.pack(side="left", fill="both", expand=True)
+
+        # preview + scrubber
+        self.cv = tk.Canvas(left, bg=CANVAS_BG, highlightthickness=0)
+        self.cv.pack(fill="both", expand=True)
+        self.cv.bind("<Configure>", lambda e: (self.redraw(), self.schedule_frame(250)))
+        self.cv.bind("<ButtonPress-1>", self.on_press)
+        self.cv.bind("<B1-Motion>", self.on_drag)
+        self.cv.bind("<ButtonRelease-1>", self.on_release)
+        sr = ttk.Frame(left)
+        sr.pack(fill="x", pady=(6, 0))
+        self.time_var = tk.DoubleVar(value=0.0)
+        ttk.Scale(sr, from_=0, to=self.dur, variable=self.time_var, takefocus=False,
+                  command=lambda v: self.on_scrub()).pack(side="left", fill="x", expand=True)
+        self.time_lbl = ttk.Label(sr, style="Muted.TLabel", width=17, anchor="e")
+        self.time_lbl.pack(side="left", padx=(8, 8))
+        self.safe = tk.BooleanVar(value=True)
+        cb = ttk.Checkbutton(sr, text="Safe zone", variable=self.safe, command=self.redraw,
+                             takefocus=False)
+        cb.pack(side="left")
+        Tip(cb, "Dashed box: the part of the video that TikTok's buttons and caption don't cover")
+
+        # on-video text editor
+        ttk.Label(left, text="On-video text", style="Head.TLabel").pack(anchor="w", pady=(10, 4))
+        ed = ttk.Frame(left)
+        ed.pack(fill="x")
+        ed.columnconfigure(8, weight=1)
+        self.app.btn(ed, ICON["add"] + "  Add text", self.add_text,
+                     style="ToolText.TButton").grid(row=0, column=0, sticky="w")
+        self.del_btn = self.app.btn(ed, ICON["delete"], self.remove_text, style="Tool.TButton",
+                                    tip="Remove this text")
+        self.del_btn.grid(row=0, column=1, padx=(2, 12))
+        self.style_var = tk.StringVar(value="Outline")
+        self.color_var = tk.StringVar(value="White")
+        self.size_var = tk.DoubleVar(value=7.0)
+        ttk.Label(ed, text="Style").grid(row=0, column=2, padx=(0, 4))
+        self.style_cb = ttk.Combobox(ed, textvariable=self.style_var, values=TEXT_STYLES,
+                                     state="readonly", width=9, takefocus=False)
+        self.style_cb.grid(row=0, column=3)
+        ttk.Label(ed, text="Color").grid(row=0, column=4, padx=(10, 4))
+        self.color_cb = ttk.Combobox(ed, textvariable=self.color_var, values=list(TEXT_COLORS),
+                                     state="readonly", width=8, takefocus=False)
+        self.color_cb.grid(row=0, column=5)
+        ttk.Label(ed, text="Size").grid(row=0, column=6, padx=(10, 4))
+        self.size_sc = ttk.Scale(ed, from_=3, to=16, variable=self.size_var, length=100,
+                                 takefocus=False)
+        self.size_sc.grid(row=0, column=7, sticky="w")
+
+        self.text_box = tk.Text(ed, height=2, bg=FIELD, fg=FG, insertbackground=FG, relief="flat",
+                                font=UI_FONT, wrap="word", padx=6, pady=4, undo=True,
+                                highlightthickness=1, highlightbackground=BORDER,
+                                highlightcolor=ACCENT)
+        self.text_box.grid(row=1, column=0, columnspan=9, sticky="ew", pady=6)
+        self.text_box.bind("<KeyRelease>", lambda e: self.edit_changed())
+
+        tr = ttk.Frame(ed)
+        tr.grid(row=2, column=0, columnspan=9, sticky="w")
+        self.from_var, self.to_var = tk.StringVar(), tk.StringVar()
+        ttk.Label(tr, text="Show from").pack(side="left")
+        self.from_e = ttk.Entry(tr, textvariable=self.from_var, width=8)
+        self.from_e.pack(side="left", padx=(6, 2))
+        self.from_btn = self.app.btn(tr, "◂ playhead", lambda: self.set_time("start"),
+                                     style="ToolText.TButton", tip="Start at the slider position")
+        self.from_btn.pack(side="left")
+        ttk.Label(tr, text="to").pack(side="left", padx=(10, 0))
+        self.to_e = ttk.Entry(tr, textvariable=self.to_var, width=8)
+        self.to_e.pack(side="left", padx=(6, 2))
+        self.to_btn = self.app.btn(tr, "◂ playhead", lambda: self.set_time("end"),
+                                   style="ToolText.TButton", tip="End at the slider position")
+        self.to_btn.pack(side="left")
+        self.all_btn = self.app.btn(tr, "Whole video", lambda: self.set_time("all"),
+                                    style="ToolText.TButton")
+        self.all_btn.pack(side="left", padx=(10, 0))
+        ttk.Label(left, text="Click text on the preview to select it, drag to move it. "
+                             "Seconds can be typed as 12.5 or 0:12.5.",
+                  style="Muted.TLabel", font=SMALL_FONT).pack(anchor="w", pady=(4, 0))
+        self.editor = [self.del_btn, self.style_cb, self.color_cb, self.size_sc, self.from_e,
+                       self.to_e, self.from_btn, self.to_btn, self.all_btn]
+        for var in (self.style_var, self.color_var, self.size_var, self.from_var, self.to_var):
+            var.trace_add("write", lambda *a: self.edit_changed())
+
+        # right column: account, caption, cover, privacy, disclosure, post
+        def head(text, top=10):
+            ttk.Label(right, text=text, style="Head.TLabel").pack(anchor="w", pady=(top, 4))
+
+        # bottom first, so the Post button always keeps its space
+        bottom = ttk.Frame(right)
+        bottom.pack(side="bottom", fill="x")
+        self.consent = ttk.Frame(bottom)
+        self.consent.pack(fill="x", pady=(0, 6))
+        pr = ttk.Frame(bottom)
+        pr.pack(fill="x")
+        self.post_btn = ttk.Button(pr, text="Post", style="Accent.TButton", command=self.post,
+                                   takefocus=False)
+        self.post_btn.pack(side="right")
+        self.prog = ttk.Progressbar(pr, maximum=100)
+        self.prog.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        self.status = ttk.Label(bottom, text="", style="Muted.TLabel", font=SMALL_FONT,
+                                wraplength=350, justify="left")
+        self.status.pack(anchor="w", pady=(6, 0))
+        self.hint = ttk.Label(bottom, text="", foreground="#ffb454", font=SMALL_FONT,
+                              wraplength=350, justify="left")
+        self.hint.pack(anchor="w", pady=(0, 4), before=self.consent)
+        self.consent_key = None
+
+        head("Account", 0)
+        acct = ttk.Frame(right)
+        acct.pack(fill="x")
+        self.keys_btn = self.app.btn(acct, "Keys", self.edit_keys, style="ToolText.TButton",
+                                     tip="TikTok developer app keys")
+        self.keys_btn.pack(side="right", padx=(4, 0))
+        self.connect_btn = ttk.Button(acct, text="Connect", command=self.connect, takefocus=False)
+        self.connect_btn.pack(side="right")
+        names = ttk.Frame(acct)
+        names.pack(side="left", fill="x", expand=True)
+        self.acct_lbl = ttk.Label(names, text="", font=("Segoe UI Semibold", 11))
+        self.acct_lbl.pack(anchor="w")
+        self.acct_sub = ttk.Label(names, text="", style="Muted.TLabel", font=SMALL_FONT,
+                                  wraplength=200, justify="left")
+        self.acct_sub.pack(anchor="w")
+
+        ch = ttk.Frame(right)
+        ch.pack(fill="x", pady=(10, 4))
+        ttk.Label(ch, text="Caption", style="Head.TLabel").pack(side="left")
+        self.count_lbl = ttk.Label(ch, style="Muted.TLabel", font=SMALL_FONT)
+        self.count_lbl.pack(side="right")
+        self.caption = tk.Text(right, height=4, bg=FIELD, fg=FG, insertbackground=FG,
+                               relief="flat", font=UI_FONT, wrap="word", padx=6, pady=4, undo=True,
+                               highlightthickness=1, highlightbackground=BORDER,
+                               highlightcolor=ACCENT)
+        self.caption.pack(fill="x")
+        self.caption.bind("<KeyRelease>", lambda e: self.update_count())
+
+        head("Cover")
+        self.cover_mode = tk.StringVar(value="frame")
+        self.cover_mode.trace_add("write", lambda *a: (self.redraw(), self.update_post()))
+        cf = ttk.Frame(right)
+        cf.pack(fill="x")
+        cf.columnconfigure(1, weight=1)
+        self.cover_frame_rb = ttk.Radiobutton(cf, text="", value="frame", variable=self.cover_mode,
+                                              takefocus=False)
+        self.cover_frame_rb.grid(row=0, column=0, columnspan=2, sticky="w")
+        self.app.btn(cf, "Use slider frame", self.use_frame, style="ToolText.TButton",
+                     tip="Make the frame at the slider the cover").grid(row=0, column=2, sticky="e")
+        ttk.Radiobutton(cf, text="Own image", value="image", variable=self.cover_mode,
+                        takefocus=False).grid(row=1, column=0, sticky="w", pady=(4, 0))
+        self.cover_name = ttk.Label(cf, text="", style="Muted.TLabel", font=SMALL_FONT)
+        self.cover_name.grid(row=1, column=1, sticky="w", padx=6, pady=(4, 0))
+        self.app.btn(cf, "Choose…", self.choose_cover, style="ToolText.TButton",
+                     tip="It becomes the first frame of the video").grid(row=1, column=2, sticky="e",
+                                                                         pady=(4, 0))
+        self.update_cover_label()
+
+        head("Who can view this video")
+        self.privacy = tk.StringVar()
+        self.privacy_cb = ttk.Combobox(right, textvariable=self.privacy, state="readonly",
+                                       takefocus=False)
+        self.privacy_cb.pack(fill="x")
+        self.privacy.trace_add("write", lambda *a: self.update_post())
+
+        al = ttk.Frame(right)
+        al.pack(fill="x", pady=(6, 0))
+        ttk.Label(al, text="Allow", style="Muted.TLabel").pack(side="left", padx=(0, 10))
+        self.allow = {}
+        for key, label in (("comment", "Comment"), ("duet", "Duet"), ("stitch", "Stitch")):
+            v = tk.BooleanVar(value=False)
+            cb = ttk.Checkbutton(al, text=label, variable=v, takefocus=False)
+            cb.pack(side="left", padx=(0, 14))
+            self.allow[key] = (v, cb)
+
+        self.disclose = tk.BooleanVar(value=False)
+        self.brand_own = tk.BooleanVar(value=False)
+        self.brand_paid = tk.BooleanVar(value=False)
+        self.aigc = tk.BooleanVar(value=False)
+        ttk.Checkbutton(right, text="AI-generated content", variable=self.aigc,
+                        takefocus=False).pack(anchor="w", pady=(12, 0))
+        ttk.Checkbutton(right, text="Promotes a brand, product or service",
+                        variable=self.disclose, takefocus=False).pack(anchor="w", pady=(4, 0))
+        self.disc_box = ttk.Frame(right)
+        self.disc_box.pack(fill="x")
+        self.disc_inner = ttk.Frame(self.disc_box, padding=(22, 2, 0, 0))
+        ttk.Checkbutton(self.disc_inner, text="Your brand  (you're promoting yourself)",
+                        variable=self.brand_own, takefocus=False).pack(anchor="w")
+        ttk.Checkbutton(self.disc_inner, text="Branded content  (a paid partnership)",
+                        variable=self.brand_paid, takefocus=False).pack(anchor="w")
+        self.disc_lbl = ttk.Label(self.disc_inner, style="Muted.TLabel", font=SMALL_FONT,
+                                  wraplength=320, justify="left")
+        self.disc_lbl.pack(anchor="w")
+        for v in (self.disclose, self.brand_own, self.brand_paid):
+            v.trace_add("write", lambda *a: self.update_post())
+
+
+    # ---------- account ----------
+    def edit_keys(self):
+        KeysDialog(self, self.tt, self.refresh_account)
+
+    def refresh_account(self):
+        self.creator = None
+        if not self.tt.has_keys:
+            self.acct_lbl.config(text="Not set up")
+            self.acct_sub.config(text="Add the keys of your TikTok developer app to link an account.")
+            self.connect_btn.config(text="Set up…")
+        elif not self.tt.connected:
+            self.acct_lbl.config(text="Not connected")
+            self.acct_sub.config(text="Log in with the TikTok account you want to post to.")
+            self.connect_btn.config(text="Connect")
+        else:
+            self.acct_lbl.config(text="Loading…")
+            self.acct_sub.config(text="")
+            self.connect_btn.config(text="Disconnect")
+            threading.Thread(target=self.load_creator, daemon=True).start()
+        self.update_post()
+
+    def load_creator(self):
+        try:
+            self.q.put(("creator", self.tt.creator_info()))
+        except TikTokError as e:
+            self.q.put(("creator_err", e.code, str(e)))
+
+    def show_creator(self, info):
+        self.creator = info
+        self.acct_lbl.config(text=info.get("creator_nickname") or "TikTok account")
+        user = info.get("creator_username")
+        self.acct_sub.config(text=f"@{user}" if user else "")
+        for key, field in (("comment", "comment_disabled"), ("duet", "duet_disabled"),
+                           ("stitch", "stitch_disabled")):
+            v, cb = self.allow[key]
+            if info.get(field):
+                v.set(False)
+                cb.state(["disabled"])
+            else:
+                cb.state(["!disabled"])
+        self.update_post()
+
+    def connect(self):
+        if self.job and self.connect_btn.cget("text") == "Cancel login":
+            self.job.set()
+            return
+        if self.job:
+            return
+        if not self.tt.has_keys:
+            self.edit_keys()
+        elif self.tt.connected:
+            if messagebox.askyesno("TikTok", "Disconnect this TikTok account from q-edit?",
+                                   parent=self):
+                self.tt.disconnect()
+                self.refresh_account()
+        else:
+            self.job = threading.Event()
+            job = self.job
+            self.connect_btn.config(text="Cancel login")
+            self.status.config(text="Finish the login in your browser…")
+            self.update_post()
+
+            def run():
+                try:
+                    self.tt.login(job)
+                    self.q.put(("login", None))
+                except TikTokError as e:
+                    self.q.put(("login", str(e)))
+            threading.Thread(target=run, daemon=True).start()
+
+    # ---------- post settings ----------
+    def update_count(self):
+        n = len(self.caption.get("1.0", "end-1c").encode("utf-16-le")) // 2
+        self.count_lbl.config(text=f"{n} / {CAPTION_MAX}",
+                              foreground="#ff6b6b" if n > CAPTION_MAX else MUTED)
+        self.update_post()
+
+    def privacy_code(self):
+        return next((k for k, v in PRIVACY_NAMES.items() if v == self.privacy.get()), None)
+
+    def blocker(self):
+        """Why Post can't be pressed yet, or ''."""
+        if not self.tt.has_keys:
+            return "Add your TikTok developer keys first (Set up…)."
+        if not self.tt.connected:
+            return "Connect a TikTok account first."
+        if not self.creator:
+            return "Loading the account…"
+        if not self.privacy.get():
+            return "Choose who can view the video."
+        if self.disclose.get() and not (self.brand_own.get() or self.brand_paid.get()):
+            return "You need to indicate if your content promotes yourself, a third party, or both."
+        if self.cover_mode.get() == "image" and not self.cover_pil:
+            return "Choose a cover image, or use a frame from the video."
+        if len(self.caption.get("1.0", "end-1c").encode("utf-16-le")) // 2 > CAPTION_MAX:
+            return f"The caption is longer than {CAPTION_MAX} characters."
+        maxd = self.creator.get("max_video_post_duration_sec")
+        if maxd and self.dur > maxd + 0.5:
+            return (f"This account can post videos up to {fmt_time(maxd)}; "
+                    f"this one is {fmt_time(self.dur)}.")
+        return ""
+
+    def update_post(self):
+        if self.closed:
+            return
+        paid = self.disclose.get() and self.brand_paid.get()
+        own = self.disclose.get() and self.brand_own.get()
+        # privacy options come from the account; branded content can't be private
+        opts = [PRIVACY_NAMES[o] for o in (self.creator or {}).get("privacy_level_options", [])
+                if o in PRIVACY_NAMES and not (paid and o == "SELF_ONLY")]
+        self.privacy_cb.config(values=opts)
+        if self.privacy.get() and self.privacy.get() not in opts:
+            if paid and self.privacy.get() == "Only me":
+                self.status.config(text="Branded content visibility cannot be set to private.")
+            self.privacy.set("")
+            return   # the trace calls update_post again
+        if self.disclose.get():
+            self.disc_inner.pack(fill="x")
+            self.disc_lbl.config(text="Your video will be labeled as 'Paid partnership'" if paid else
+                                 "Your video will be labeled as 'Promotional content'" if own else
+                                 "Pick at least one.")
+        else:
+            self.disc_inner.pack_forget()
+        key = "paid" if paid else "music"
+        if key != self.consent_key:
+            self.consent_key = key
+            for w in self.consent.winfo_children():
+                w.destroy()
+            ttk.Label(self.consent, text="By posting, you agree to TikTok's",
+                      style="Muted.TLabel", font=SMALL_FONT).pack(anchor="w")
+            if paid:
+                links = ttk.Frame(self.consent)
+                links.pack(anchor="w")
+                link_label(links, "Branded Content Policy",
+                           tiktok_api.BRANDED_URL).pack(side="left")
+                ttk.Label(links, text="and", style="Muted.TLabel",
+                          font=SMALL_FONT).pack(side="left", padx=3)
+            link_label(self.consent, "Music Usage Confirmation",
+                       tiktok_api.MUSIC_URL).pack(anchor="w")
+        if self.job:
+            self.hint.config(text="")
+            return
+        why = self.blocker()
+        self.post_btn.state(["disabled"] if why else ["!disabled"])
+        self.hint.config(text=why)
+
+    def update_cover_label(self):
+        self.cover_frame_rb.config(text=f"Frame at {fmt_time(self.cover_t)}")
+        self.cover_name.config(text=Path(self.state["cover_img"]).name[:26]
+                               if self.cover_pil else "none chosen")
+
+    def use_frame(self):
+        self.cover_t = self.t
+        self.cover_mode.set("frame")
+        self.update_cover_label()
+        self.redraw()
+
+    def choose_cover(self):
+        path = filedialog.askopenfilename(parent=self, filetypes=[
+            ("Images", "*.png *.jpg *.jpeg *.webp *.bmp"), ("All files", "*.*")])
+        if path and self.set_cover_image(path):
+            self.cover_mode.set("image")
+            self.time_var.set(0.0)
+            self.on_scrub()
+
+    def set_cover_image(self, path):
+        try:
+            im = Image.open(path).convert("RGB")
+        except OSError:
+            messagebox.showerror("TikTok", "Could not open that image.", parent=self)
+            return False
+        # fill the frame, cropping the overflow (same as the export filter)
+        s = max(self.vw / im.width, self.vh / im.height)
+        im = im.resize((max(1, round(im.width * s)), max(1, round(im.height * s))), Image.LANCZOS)
+        l, t = (im.width - self.vw) // 2, (im.height - self.vh) // 2
+        self.cover_pil = im.crop((l, t, l + self.vw, t + self.vh))
+        self.state["cover_img"] = path
+        self.update_cover_label()
+        return True
+
+    # ---------- text ----------
+    def add_text(self):
+        prev = self.texts[self.sel] if self.sel is not None else {}
+        self.texts.append({"text": "Your text", "style": prev.get("style", "Outline"),
+                           "color": prev.get("color", "White"), "size": prev.get("size", 7.0),
+                           "x": 0.5, "y": 0.4, "start": 0.0, "end": self.dur})
+        self.select_text(len(self.texts) - 1)
+        self.text_box.focus_set()
+        self.text_box.tag_add("sel", "1.0", "end-1c")
+
+    def remove_text(self):
+        if self.sel is not None:
+            del self.texts[self.sel]
+            self.photos.clear()
+            self.select_text(None)
+
+    def select_text(self, i):
+        self.sel = i
+        self.loading = True
+        on = i is not None
+        for w in self.editor:
+            w.state(["!disabled"] if on else ["disabled"])
+            if on and isinstance(w, ttk.Combobox):
+                w.state(["readonly"])
+        self.text_box.config(state="normal")
+        self.text_box.delete("1.0", "end")
+        if on:
+            it = self.texts[i]
+            self.text_box.insert("1.0", it["text"])
+            self.style_var.set(it["style"])
+            self.color_var.set(it["color"])
+            self.size_var.set(it["size"])
+            self.from_var.set(f"{it['start']:.2f}")
+            self.to_var.set(f"{it['end']:.2f}")
+        else:
+            self.text_box.config(state="disabled")
+            self.from_var.set("")
+            self.to_var.set("")
+        self.loading = False
+        self.redraw()
+
+    def edit_changed(self):
+        if self.loading or self.sel is None:
+            return
+        it = self.texts[self.sel]
+        it["text"] = self.text_box.get("1.0", "end-1c")
+        it["style"], it["color"] = self.style_var.get(), self.color_var.get()
+        it["size"] = round(self.size_var.get(), 1)
+        s, e = parse_secs(self.from_var.get()), parse_secs(self.to_var.get())
+        if s is not None:
+            it["start"] = min(max(s, 0.0), self.dur)
+        if e is not None:
+            it["end"] = min(max(e, 0.0), self.dur)
+        self.redraw()
+
+    def set_time(self, which):
+        if self.sel is None:
+            return
+        if which == "start":
+            self.from_var.set(f"{self.t:.2f}")
+        elif which == "end":
+            self.to_var.set(f"{self.t:.2f}")
+        else:
+            self.from_var.set("0.00")
+            self.to_var.set(f"{self.dur:.2f}")
+
+    def text_photo(self, i, s):
+        it = self.texts[i]
+        key = (it["text"], it["style"], it["color"], it["size"], round(s, 4))
+        cached = self.photos.get(i)
+        if not cached or cached[0] != key:
+            img = render_text(it, self.vw)
+            img = img.resize((max(1, round(img.width * s)), max(1, round(img.height * s))),
+                             Image.LANCZOS)
+            cached = self.photos[i] = (key, ImageTk.PhotoImage(img))
+        return cached[1]
+
+    # ---------- preview ----------
+    def on_scrub(self):
+        self.t = self.time_var.get()
+        self.schedule_frame(40)
+        self.redraw()
+
+    def schedule_frame(self, delay):
+        if self.frame_job:
+            self.after_cancel(self.frame_job)
+        self.frame_job = self.after(delay, self.fetch_frame)
+
+    def fetch_frame(self):
+        self.frame_job = None
+        self.frame_req += 1
+        token = self.frame_req
+        h = min(self.vh, max(self.cv.winfo_height(), 200)) // 2 * 2
+        t = min(self.t, max(self.dur - 0.05, 0.0))
+        cmd = ["ffmpeg", "-v", "error", "-ss", f"{t:.3f}", "-i", self.path, "-frames:v", "1",
+               "-vf", f"scale=-2:{h}", "-f", "image2pipe", "-c:v", "bmp", "-"]
+        threading.Thread(target=lambda: self.q.put(("frame", token, run_bmp(cmd))),
+                         daemon=True).start()
+
+    def redraw(self):
+        if self.closed:
+            return
+        cv = self.cv
+        cv.delete("all")
+        cw, ch = max(cv.winfo_width(), 1), max(cv.winfo_height(), 1)
+        s = min(cw / self.vw, ch / self.vh)
+        dw, dh = max(2, int(self.vw * s)), max(2, int(self.vh * s))
+        ox, oy = (cw - dw) // 2, (ch - dh) // 2
+        self.geo = (s, dw, dh, ox, oy)
+        self.time_lbl.config(text=f"{fmt_time(self.t)} / {fmt_time(self.dur)}")
+
+        # with an own cover image, the first frame of the posted video is that image
+        own_cover = self.cover_mode.get() == "image" and self.cover_pil and self.t < 0.02
+        base = self.cover_pil if own_cover else self.frame
+        if base is not None:
+            key = (id(base), dw, dh)
+            if key != self.frame_key:
+                self.frame_photo = ImageTk.PhotoImage(base.resize((dw, dh), Image.BILINEAR))
+                self.frame_key = key
+            cv.create_image(ox, oy, image=self.frame_photo, anchor="nw")
+        else:
+            cv.create_rectangle(ox, oy, ox + dw, oy + dh, fill="#000000", outline="")
+
+        self.hitboxes = []
+        if not own_cover:
+            for i, it in enumerate(self.texts):
+                active = it["start"] <= self.t <= it["end"]
+                if not (active or i == self.sel):
+                    continue
+                cx, cy = ox + it["x"] * dw, oy + it["y"] * dh
+                if it["text"].strip():
+                    ph = self.text_photo(i, s)
+                    cv.create_image(cx, cy, image=ph)
+                    w2, h2 = ph.width() / 2, ph.height() / 2
+                else:
+                    w2, h2 = 60, 14
+                    cv.create_text(cx, cy, text="type your text", fill=MUTED, font=UI_FONT)
+                self.hitboxes.append((i, cx - w2, cy - h2, cx + w2, cy + h2))
+                if i == self.sel:
+                    cv.create_rectangle(cx - w2, cy - h2, cx + w2, cy + h2, dash=(3, 3),
+                                        outline="#ffcc00" if active else MUTED)
+                    if not active:
+                        cv.create_text(cx, cy + h2 + 10, text="not shown at this time",
+                                       fill=MUTED, font=SMALL_FONT)
+        if self.drag and self.drag.get("snap"):
+            cv.create_line(ox + dw / 2, oy, ox + dw / 2, oy + dh, fill=ACCENT, dash=(4, 3))
+        if self.safe.get():
+            L, T, R, B = SAFE_ZONE
+            cv.create_rectangle(ox + L * dw, oy + T * dh, ox + (1 - R) * dw, oy + (1 - B) * dh,
+                                outline="#9a9aa8", dash=(5, 4))
+        is_cover = own_cover or (self.cover_mode.get() == "frame"
+                                 and abs(self.t - self.cover_t) < 0.04)
+        if is_cover:
+            t = cv.create_text(ox + 10, oy + 10, text="Cover", anchor="nw", fill="white",
+                               font=("Segoe UI Semibold", 10))
+            bx = cv.bbox(t)
+            cv.tag_lower(cv.create_rectangle(bx[0] - 6, bx[1] - 3, bx[2] + 6, bx[3] + 3,
+                                             fill="#fe2c55", outline=""), t)
+
+    def on_press(self, e):
+        self.focus_set()
+        hit = next((h for h in reversed(self.hitboxes)
+                    if h[1] <= e.x <= h[3] and h[2] <= e.y <= h[4]), None)
+        if not hit:
+            self.drag = None
+            self.select_text(None)
+            return
+        i = hit[0]
+        if i != self.sel:
+            self.select_text(i)
+        it = self.texts[i]
+        self.drag = {"i": i, "x": e.x, "y": e.y, "ox": it["x"], "oy": it["y"]}
+
+    def on_drag(self, e):
+        if not self.drag:
+            return
+        _, dw, dh, _, _ = self.geo
+        it = self.texts[self.drag["i"]]
+        nx = min(max(self.drag["ox"] + (e.x - self.drag["x"]) / dw, 0.0), 1.0)
+        ny = min(max(self.drag["oy"] + (e.y - self.drag["y"]) / dh, 0.0), 1.0)
+        self.drag["snap"] = abs(nx - 0.5) < 0.015
+        it["x"], it["y"] = (0.5 if self.drag["snap"] else nx), ny
+        self.redraw()
+
+    def on_release(self, e):
+        self.drag = None
+        self.redraw()
+
+    # ---------- posting ----------
+    def post(self):
+        if self.job:
+            self.job.set()
+            self.status.config(text="Cancelling…")
+            return
+        if self.blocker():
+            return
+        own = self.disclose.get() and self.brand_own.get()
+        paid = self.disclose.get() and self.brand_paid.get()
+        cover_img = self.state.get("cover_img") if self.cover_mode.get() == "image" else None
+        info = {
+            "title": self.caption.get("1.0", "end-1c"),
+            "privacy_level": self.privacy_code(),
+            "disable_comment": not self.allow["comment"][0].get(),
+            "disable_duet": not self.allow["duet"][0].get(),
+            "disable_stitch": not self.allow["stitch"][0].get(),
+            "video_cover_timestamp_ms": 0 if cover_img else int(self.cover_t * 1000),
+            "brand_content_toggle": paid, "brand_organic_toggle": own,
+            "is_aigc": self.aigc.get(),
+        }
+        texts = [dict(it) for it in self.texts if it["text"].strip() and it["end"] > it["start"]]
+        self.job = threading.Event()
+        self.post_btn.config(text="Cancel")
+        self.post_btn.state(["!disabled"])
+        self.prog["value"] = 0
+        threading.Thread(target=self.run_post, args=(info, texts, cover_img, self.job),
+                         daemon=True).start()
+
+    def run_post(self, info, texts, cover_img, job):
+        tmp = tempfile.mkdtemp(prefix="q-edit_")
+
+        def progress(text, frac):
+            self.q.put(("progress", text, frac))
+        try:
+            progress("Checking the account…", 0)
+            creator = self.tt.creator_info()   # TikTok asks for fresh creator info per post
+            maxd = creator.get("max_video_post_duration_sec")
+            if maxd and self.dur > maxd + 0.5:
+                raise TikTokError("too_long", f"This account can post videos up to {fmt_time(maxd)}.")
+            src = self.prepare(tmp, texts, cover_img, job, progress)
+            st = self.tt.post_video(src, info, progress, job)
+            self.q.put(("posted", st.get("status"), info["privacy_level"]))
+        except TikTokError as e:
+            self.q.put(("post_err", e.code, str(e)))
+        except Exception as e:   # ffmpeg / file errors: show them instead of dying silently
+            self.q.put(("post_err", "error", str(e)))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def prepare_cmd(self, tmp, texts, cover_img):
+        """FFmpeg command that writes the file to upload, or None if the export can go as is."""
+        needs_encode = bool(texts or cover_img) or self.info["vcodec"] not in TIKTOK_CODECS
+        if not needs_encode and Path(self.path).suffix.lower() in tiktok_api.MIME:
+            return None, self.path
+        out = os.path.join(tmp, "tiktok.mp4")
+        cmd = ["ffmpeg", "-y", "-v", "error", "-nostats", "-progress", "pipe:1", "-i", self.path]
+        if needs_encode:
+            fc, cur, n = [], "[0:v]", 1
+            for i, it in enumerate(texts):
+                img = render_text(it, self.vw)
+                png = os.path.join(tmp, f"text{i}.png")
+                img.save(png)
+                x = round(it["x"] * self.vw - img.width / 2)
+                y = round(it["y"] * self.vh - img.height / 2)
+                cmd += ["-i", png]
+                fc.append(f"{cur}[{n}:v]overlay={x}:{y}:"
+                          f"enable='between(t,{it['start']:.3f},{it['end']:.3f})'[t{n}]")
+                cur, n = f"[t{n}]", n + 1
+            if cover_img:
+                png = os.path.join(tmp, "cover.png")
+                self.cover_pil.save(png)
+                cmd += ["-i", png]
+                fc.append(f"{cur}[{n}:v]overlay=0:0:enable='eq(n,0)'[cov]")
+                cur = "[cov]"
+            fc.append(f"{cur}format=yuv420p[out]")
+            cmd += ["-filter_complex", ";".join(fc), "-map", "[out]", "-map", "0:a?",
+                    "-c:v", "libx264", "-preset", "medium", "-crf", "17"]
+        else:
+            cmd += ["-map", "0:v", "-map", "0:a?", "-c:v", "copy"]
+        cmd += (["-c:a", "copy"] if self.info["acodec"] in (None, "aac")
+                else ["-c:a", "aac", "-b:a", "192k"])
+        return cmd + ["-movflags", "+faststart", out], out
+
+    def prepare(self, tmp, texts, cover_img, job, progress):
+        cmd, out = self.prepare_cmd(tmp, texts, cover_img)
+        if not cmd:
+            return out
+        progress("Adding text and cover…", 0)
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             stdin=subprocess.DEVNULL, text=True, creationflags=NOWIN)
+        err = []
+        threading.Thread(target=lambda: err.append(p.stderr.read()), daemon=True).start()
+        for line in p.stdout:
+            if job.is_set():
+                p.kill()
+                break
+            if line.startswith("out_time_us="):
+                try:
+                    f = min(1.0, int(line.split("=", 1)[1]) / 1e6 / self.dur)
+                    progress(f"Adding text and cover…  {f:.0%}", f)
+                except ValueError:
+                    pass
+        p.wait()
+        if job.is_set():
+            raise TikTokError("cancelled", "Cancelled.")
+        if p.returncode != 0:
+            time.sleep(0.1)
+            raise TikTokError("encode_failed", "Could not add the text: " +
+                              ("".join(err)).strip()[-400:])
+        return out
+
+    # ---------- events ----------
+    def poll(self):
+        if self.closed:
+            return
+        try:
+            while True:
+                msg = self.q.get_nowait()
+                kind = msg[0]
+                if kind == "frame":
+                    if msg[1] == self.frame_req and msg[2] is not None:
+                        self.frame = msg[2]
+                        self.redraw()
+                elif kind == "creator":
+                    self.show_creator(msg[1])
+                elif kind == "creator_err":
+                    if msg[1] in ("login_required", "access_token_invalid", "invalid_grant",
+                                  "auth_removed"):
+                        self.tt.forget()
+                        self.refresh_account()
+                    self.acct_lbl.config(text="Account problem")
+                    self.acct_sub.config(text=msg[2])
+                elif kind == "login":
+                    self.job = None
+                    self.status.config(text=msg[1] or "")
+                    self.refresh_account()
+                elif kind == "progress":
+                    self.status.config(text=msg[1])
+                    self.prog["value"] = msg[2] * 100
+                elif kind == "posted":
+                    self.end_job()
+                    self.prog["value"] = 100
+                    text = ("Posted! TikTok can take a few minutes to show it on your profile."
+                            if msg[1] == "PUBLISH_COMPLETE" else
+                            "Uploaded. TikTok is still processing it; it will show on your "
+                            "profile in a few minutes.")
+                    if msg[2] == "SELF_ONLY":
+                        text += " It's set to Only me; change that in the TikTok app."
+                    self.status.config(text=text)
+                elif kind == "post_err":
+                    self.end_job()
+                    self.prog["value"] = 0
+                    if msg[1] == "cancelled":
+                        self.status.config(text="Cancelled.")
+                    else:
+                        self.status.config(text="Posting failed.")
+                        messagebox.showerror("Post to TikTok", msg[2], parent=self)
+                    if msg[1] in ("access_token_invalid", "auth_removed", "login_required"):
+                        self.tt.forget()
+                        self.refresh_account()
+        except queue.Empty:
+            pass
+        self.after(50, self.poll)
+
+    def end_job(self):
+        self.job = None
+        self.post_btn.config(text="Post")
+        self.update_post()
+
+    def close(self):
+        if self.job:
+            if not messagebox.askyesno("Post to TikTok", "Stop the upload and close?", parent=self):
+                return
+            self.job.set()
+        self.state.update(caption=self.caption.get("1.0", "end-1c"), cover_t=self.cover_t,
+                          cover_mode=self.cover_mode.get())
+        self.closed = True
+        self.app.tt_panel = None
+        self.destroy()
+
+
+# ---------------------------------------------------------------- inspector control
+class SlideField:
+    """DaVinci-style number control on one grid row: label, optional slider, value box, reset.
+    Drag the value box sideways to change it (Shift = fine, Ctrl = coarse), click it to type,
+    use the wheel to nudge, double-click the slider or click the arrow to reset."""
+
+    def __init__(self, parent, row, label, lo, hi, step, fmt, default, on_change, on_end,
+                 slider=True):
+        self.lo, self.hi, self.step, self.fmt, self.default = lo, hi, step, fmt, default
+        self.on_change, self.on_end = on_change, on_end
+        self.value, self.editor = default, None
+        ttk.Label(parent, text=label, style="PanelMuted.TLabel").grid(row=row, column=0,
+                                                                      sticky="w", padx=(0, 8))
+        self.cv = None
+        if slider:
+            self.cv = tk.Canvas(parent, height=22, bg=PANEL, highlightthickness=0, cursor="hand2")
+            self.cv.grid(row=row, column=1, sticky="ew", padx=(0, 8))
+            self.cv.bind("<Configure>", lambda e: self.draw())
+            self.cv.bind("<ButtonPress-1>", self.slide)
+            self.cv.bind("<B1-Motion>", self.slide)
+            self.cv.bind("<ButtonRelease-1>", lambda e: self.on_end())
+            self.cv.bind("<Double-Button-1>", lambda e: self.set(self.default, end=True))
+            self.cv.bind("<MouseWheel>", self.wheel)
+        self.box = tk.Label(parent, bg=FIELD, fg=FG, font=("Consolas", 10), width=9, anchor="e",
+                            padx=6, pady=2, cursor="sb_h_double_arrow", highlightthickness=1,
+                            highlightbackground=BORDER)
+        self.box.grid(row=row, column=2, pady=2, sticky="e")
+        self.box.bind("<ButtonPress-1>", self.press)
+        self.box.bind("<B1-Motion>", self.scrub)
+        self.box.bind("<ButtonRelease-1>", self.release)
+        self.box.bind("<MouseWheel>", self.wheel)
+        self.box.bind("<Enter>", lambda e: self.box.config(highlightbackground=ACCENT))
+        self.box.bind("<Leave>", lambda e: self.box.config(highlightbackground=BORDER))
+        reset = tk.Label(parent, text=ICON["undo"], bg=PANEL, fg=MUTED, font=(ICON_FONT, 9),
+                         cursor="hand2", padx=4)
+        reset.grid(row=row, column=3, padx=(4, 0))
+        reset.bind("<Button-1>", lambda e: self.set(self.default, end=True))
+        reset.bind("<Enter>", lambda e: reset.config(fg=FG))
+        reset.bind("<Leave>", lambda e: reset.config(fg=MUTED))
+        Tip(reset, f"Reset {label.lower()}")
+        self.show(default)
+
+    def show(self, v):
+        """Displays a value from the model (no callbacks)."""
+        self.value = v
+        self.box.config(text=self.fmt.format(v))
+        self.draw()
+
+    def set(self, v, end=False):
+        v = min(max(v, self.lo), self.hi)
+        if v != self.value:
+            self.show(v)
+            self.on_change(v)
+        if end:
+            self.on_end()
+
+    def draw(self):
+        if not self.cv:
+            return
+        c = self.cv
+        c.delete("all")
+        w, mid = c.winfo_width(), 11
+        if w < 24:
+            return
+        x0, x1 = 8, w - 8
+
+        def x_of(v):
+            return x0 + (x1 - x0) * (min(max(v, self.lo), self.hi) - self.lo) / (self.hi - self.lo)
+        c.create_line(x0, mid, x1, mid, fill=BORDER, width=4, capstyle="round")
+        x, xd = x_of(self.value), x_of(self.default)
+        if abs(x - xd) >= 1:   # filled from the default, so a changed value stands out
+            c.create_line(xd, mid, x, mid, fill=ACCENT, width=4)
+        c.create_line(xd, mid - 5, xd, mid + 5, fill=MUTED)
+        c.create_oval(x - 7, mid - 7, x + 7, mid + 7, fill="white", outline=ACCENT, width=2)
+
+    def slide(self, e):
+        w = self.cv.winfo_width()
+        v = self.lo + (self.hi - self.lo) * (e.x - 8) / max(w - 16, 1)
+        if abs(v - self.default) <= (self.hi - self.lo) * 0.012:   # sticks to the default
+            v = self.default
+        self.set(round(v / self.step) * self.step)
+
+    def press(self, e):
+        self.px, self.pv, self.moved = e.x_root, self.value, False
+
+    def scrub(self, e):
+        dx = e.x_root - self.px
+        if not self.moved and abs(dx) < 3:
+            return
+        self.moved = True
+        mul = 0.1 if e.state & 0x1 else (10 if e.state & 0x4 else 1)
+        self.set(self.pv + dx * self.step * mul)
+
+    def release(self, e):
+        if self.moved:
+            self.on_end()
+        else:
+            self.edit()
+
+    def wheel(self, e):
+        mul = 0.1 if e.state & 0x1 else (10 if e.state & 0x4 else 1)
+        self.set(self.value + (1 if e.delta > 0 else -1) * self.step * 4 * mul, end=True)
+        return "break"
+
+    def edit(self):
+        """Type a value: Enter applies, Esc cancels."""
+        if self.editor:
+            return
+        en = self.editor = tk.Entry(self.box.master, bg=FIELD, fg=FG, insertbackground=FG,
+                                    relief="flat", font=("Consolas", 10), justify="right",
+                                    highlightthickness=1, highlightcolor=ACCENT,
+                                    highlightbackground=ACCENT)
+        en.insert(0, re.sub(r"[^0-9.+-]", "", self.fmt.format(self.value)))
+        en.select_range(0, "end")
+        en.place(in_=self.box, x=0, y=0, relwidth=1, relheight=1)
+        en.focus_set()
+
+        def done(apply):
+            if self.editor is None:
+                return
+            text, self.editor = en.get(), None
+            en.destroy()
+            if apply:
+                try:
+                    self.set(float(re.sub(r"[^0-9.+-]", "", text.replace(",", "."))), end=True)
+                except ValueError:
+                    pass
+        en.bind("<Return>", lambda e: done(True))
+        en.bind("<KP_Enter>", lambda e: done(True))
+        en.bind("<Escape>", lambda e: done(False))
+        en.bind("<FocusOut>", lambda e: done(True))
+
+
+# ---------------------------------------------------------------- main window
+class Tip:
+    """Small hover tooltip."""
+
+    def __init__(self, widget, text):
+        self.w, self.text, self.win, self.job = widget, text, None, None
+        widget.bind("<Enter>", lambda e: self.arm(), add="+")
+        widget.bind("<Leave>", lambda e: self.hide(), add="+")
+        widget.bind("<ButtonPress>", lambda e: self.hide(), add="+")
+
+    def arm(self):
+        self.hide()
+        self.job = self.w.after(450, self.show)
+
+    def show(self):
+        self.job = None
+        self.win = tk.Toplevel(self.w)
+        self.win.wm_overrideredirect(True)
+        self.win.attributes("-topmost", True)
+        tk.Label(self.win, text=self.text, bg="#0b0b0e", fg=FG, font=SMALL_FONT, padx=7, pady=3,
+                 highlightthickness=1, highlightbackground=BORDER).pack()
+        self.win.geometry(f"+{self.w.winfo_rootx()}+{self.w.winfo_rooty() + self.w.winfo_height() + 4}")
+
+    def hide(self):
+        if self.job:
+            self.w.after_cancel(self.job)
+            self.job = None
+        if self.win:
+            self.win.destroy()
+            self.win = None
+
+
+def tc(t, step):
+    m, s = divmod(t + 1e-6, 60)
+    return f"{int(m)}:{s:04.1f}" if step < 1 else f"{int(m)}:{int(s):02d}"
+
+
+class App:
+    def __init__(self, root):
+        self.root = root
+        root.title("q-edit")
+        if ICON_FILE.exists():
+            try:
+                root.iconbitmap(default=str(ICON_FILE))
+            except tk.TclError:
+                pass
+        root.geometry("1180x880")
+        root.minsize(820, 600)
+        apply_theme(root)
+
+        self.q = queue.Queue()
+        # timeline: clips sit on tracks. Higher video tracks cover lower ones, audio tracks mix.
+        # clip = {"id", "kind" ("v"/"a"), "track", "path", "start", "inp", "dur", "link"}
+        self.media = {}
+        self.vtracks = [{"hidden": False}]
+        self.atracks = [{"muted": False}]
+        self.clips = []
+        self.sel = set()
+        self.next_id = 1
+        self.undo_stack, self.redo_stack = [], []
+        self.vw = self.vh = 0
+        self.pfps = 30.0
+        self.cur = 0.0
+        self.mark_in = self.mark_out = None
+        self.pps, self.view_t, self.yoff = 40.0, 0.0, 0.0
+        self.tdrag = self.hover = None
+        self.drop = None   # files being dragged in from Explorer: {"key", "paths", "target"}
+        self.thumbs, self.peaks, self.tiles = {}, {}, {}   # timeline filmstrips and waveforms
+        self.crop = [0.0, 0.0, 0.0, 0.0]
+        self.frame = self.frame_photo = self.photo_key = None
+        self.req = 0
+        self.after_id = self.tick_id = None
+        # live inspector preview: source frames decoded once, then edited in memory
+        self.src_cache, self.src_pending = {}, set()
+        self.live_job = self.live_wanted = self.replay_job = self.vol_job = None
+        self.drag = None
+        self.s, self.ox, self.oy, self.dw, self.dh = 1.0, 0, 0, 1, 1
+        self.player = None
+        self.resume = False
+        self.export_proc = None
+        self.export_out = None
+        self.cancelled = False
+        self.codecs, self.opus_enc = [c for c in CODECS if c[1] == "libx264"], "libopus"
+        self.settings = load_settings()
+        self.exp_settings = self.settings.get("export", {})
+        self.last_dir = None
+        self.tiktok = TikTok(TIKTOK_FILE)
+        self.tt_state, self.tt_panel, self.last_export = {}, None, None
+
+        self.build_ui()
+        dark_titlebar(root)
+        root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.root.after(50, self.poll)
+        threading.Thread(target=lambda: self.q.put(("encoders", *detect_encoders())),
+                         daemon=True).start()
+
+    # ---------- UI ----------
+    def btn(self, parent, text, cmd, style="TButton", tip=None, **kw):
+        b = ttk.Button(parent, text=text, command=cmd, style=style, takefocus=False, **kw)
+        if tip:
+            Tip(b, tip)
+        return b
+
+    def tool(self, parent, icon, cmd, tip, pad=0):
+        b = self.btn(parent, ICON[icon], cmd, style="Tool.TButton", tip=tip)
+        b.pack(side="left", padx=(pad, 0))
+        return b
+
+    def toggle(self, parent, var, text, tip, icons=None, command=None):
+        """Flat button bound to a BooleanVar; highlighted while on. icons = (on, off) glyphs."""
+        b = self.btn(parent, "", None, tip=tip)
+
+        def show(*_):
+            on = var.get()
+            if icons:
+                b.config(text=ICON[icons[0] if on else icons[1]],
+                         style="ToolOn.TButton" if on else "Tool.TButton")
+            else:
+                b.config(text=text, style="ToolTextOn.TButton" if on else "ToolText.TButton")
+
+        def flip():
+            var.set(not var.get())
+            if command:
+                command()
+        b.config(command=flip)
+        var.trace_add("write", show)
+        show()
+        return b
+
+    def sep(self, parent):
+        ttk.Separator(parent, orient="vertical").pack(side="left", fill="y", padx=5, pady=3)
+
+    def build_menu(self):
+        bar = ttk.Frame(self.root, style="Bar.TFrame", padding=(4, 3, 10, 3))
+        bar.pack(fill="x")
+
+        def menu(label, items):
+            mb = tk.Menubutton(bar, text=label, bg=BG, fg=FG, activebackground=HOVER,
+                               activeforeground=FG, relief="flat", bd=0, padx=10, pady=3,
+                               font=UI_FONT, highlightthickness=0)
+            m = tk.Menu(mb, tearoff=0, bg=FIELD, fg=FG, activebackground=ACCENT,
+                        activeforeground="white", bd=0, relief="flat", font=UI_FONT,
+                        selectcolor=FG)
+            for it in items:
+                if it is None:
+                    m.add_separator()
+                elif it[0] == "check":
+                    m.add_checkbutton(label=it[1], accelerator=it[2], variable=it[3],
+                                      command=it[4] if len(it) > 4 else None)
+                else:
+                    m.add_command(label=it[0], accelerator=it[1], command=it[2])
+            mb["menu"] = m
+            mb.pack(side="left")
+
+        menu("File", [("Open video…", "Ctrl+O", self.open_video),
+                      ("Import media…", "Ctrl+I", self.add_media), None,
+                      ("Export…", "Ctrl+E", self.export),
+                      ("Post to TikTok…", "Ctrl+T", self.post_tiktok), None,
+                      ("Exit", "Alt+F4", self.on_close)])
+        menu("Edit", [("Undo", "Ctrl+Z", self.undo), ("Redo", "Ctrl+Y", self.redo), None,
+                      ("Split at playhead", "Ctrl+B", self.split),
+                      ("Delete", "Del", self.delete_sel),
+                      ("Ripple delete", "Shift+Del", lambda: self.delete_sel(True)),
+                      ("Link / unlink clips", "", self.toggle_link), None,
+                      ("Select all", "Ctrl+A", lambda: self.select(c["id"] for c in self.clips)),
+                      ("Deselect", "Esc", lambda: self.select(set())), None,
+                      ("Mark in", "I", self.set_start), ("Mark out", "O", self.set_end),
+                      ("Clear marks", "", self.clear_marks)])
+        menu("Timeline", [("Add video track", "", lambda: self.add_track("v")),
+                          ("Add audio track", "", lambda: self.add_track("a")), None,
+                          ("Zoom in", "+", lambda: self.zoom(1.5)),
+                          ("Zoom out", "−", lambda: self.zoom(1 / 1.5)),
+                          ("Zoom to fit", "Shift+Z", self.zoom_fit), None,
+                          ("check", "Snapping", "N", self.snap),
+                          ("check", "Loop playback", "", self.loop),
+                          ("check", "Mute preview", "", self.mute, self.restart_if_playing)])
+        menu("Help", [("Keyboard shortcuts", "", self.show_shortcuts)])
+
+        self.export_btn = self.btn(bar, "Export", self.export, style="Small.Accent.TButton",
+                                   tip="Export video  (Ctrl+E)")
+        self.export_btn.pack(side="right")
+        self.outsize = tk.StringVar()
+        self.outsize.trace_add("write", lambda *a: self.on_outsize())
+        out_entry = ttk.Entry(bar, textvariable=self.outsize, width=10, style="Small.TEntry")
+        out_entry.pack(side="right", padx=(4, 14))
+        out_entry.bind("<Return>", lambda e: self.root.focus_set())
+        Tip(out_entry, "Output size, e.g. 1080x1920. Blank = crop size")
+        ttk.Label(bar, text="Size", style="Muted.TLabel").pack(side="right")
+        self.ratio = tk.StringVar(value="Free")
+        cb = ttk.Combobox(bar, textvariable=self.ratio, values=list(RATIOS), width=5,
+                          state="readonly", takefocus=False, style="Small.TCombobox")
+        cb.pack(side="right", padx=(4, 12))
+        cb.bind("<<ComboboxSelected>>", lambda e: (self.apply_ratio(), self.root.focus_set()))
+        ttk.Label(bar, text="Crop", style="Muted.TLabel").pack(side="right")
+
+    def show_shortcuts(self):
+        messagebox.showinfo("Keyboard shortcuts", __doc__.split("Shortcuts:")[1].strip("\n"),
+                            parent=self.root)
+
+    def build_ui(self):
+        self.snap = tk.BooleanVar(value=True)
+        self.loop = tk.BooleanVar(value=True)
+        self.mute = tk.BooleanVar(value=False)
+        self.build_menu()
+
+        # status bar at the very bottom: export progress
+        st = ttk.Frame(self.root, style="Panel.TFrame", padding=(10, 4))
+        st.pack(side="bottom", fill="x", padx=6, pady=(4, 6))
+        self.prog = ttk.Progressbar(st, length=160, maximum=100)
+        self.prog.pack(side="left")
+        self.status = ttk.Label(st, text="Detecting encoders...", style="PanelMuted.TLabel")
+        self.status.pack(side="left", padx=10)
+        # shown once something is exported
+        self.tt_btn = self.btn(st, ICON["send"] + "  Post to TikTok",
+                               lambda: self.post_tiktok(self.last_export),
+                               style="ToolText.TButton", tip="Post the export to TikTok  (Ctrl+T)")
+        # preview above, timeline below; drag the bar between them to resize
+        self.paned = tk.PanedWindow(self.root, orient="vertical", bg=BG, bd=0, sashwidth=6,
+                                    sashrelief="flat", sashcursor="sb_v_double_arrow",
+                                    opaqueresize=True)
+        self.paned.pack(fill="both", expand=True, padx=6)
+        # top: preview with the inspector on its right (drag the bar to resize)
+        self.hpane = tk.PanedWindow(self.paned, orient="horizontal", bg=BG, bd=0, sashwidth=6,
+                                    sashrelief="flat", sashcursor="sb_h_double_arrow",
+                                    opaqueresize=True)
+        self.paned.add(self.hpane, minsize=120, stretch="always")
+        self.cv = tk.Canvas(self.hpane, bg=CANVAS_BG, highlightthickness=0)
+        self.hpane.add(self.cv, minsize=200, stretch="always")
+        self.build_inspector()
+        self.cv.bind("<Configure>", lambda e: (self.redraw(), self.schedule_frame(200)))
+        self.cv.bind("<ButtonPress-1>", self.on_press)
+        self.cv.bind("<B1-Motion>", self.on_drag)
+        self.cv.bind("<ButtonRelease-1>", self.on_release)
+        self.cv.bind("<Motion>", self.on_hover)
+
+        panel = ttk.Frame(self.paned, style="Panel.TFrame", padding=(6, 4, 6, 6))
+        self.paned.add(panel, minsize=170, stretch="never")
+        self.root.after(100, lambda: self.paned.sash_place(
+            0, 0, max(120, self.paned.winfo_height() - panel.winfo_reqheight() - 40)))
+
+        # one toolbar row: transport, edit tools, track tools, view toggles
+        tb = ttk.Frame(panel, style="Panel.TFrame")
+        tb.pack(fill="x", pady=(0, 4))
+        self.tool(tb, "prev", lambda: self.seek(self.render_range()[0]), "Go to in  (Home)")
+        self.play_btn = self.btn(tb, ICON["play"], self.toggle_play, style="PlayTool.TButton",
+                                 tip="Play / pause  (Space)")
+        self.play_btn.pack(side="left", padx=3)
+        self.tool(tb, "next", lambda: self.seek(self.render_range()[1]), "Go to out  (End)")
+        self.time_lbl = ttk.Label(tb, text="0:00.00 / 0:00.00", style="Time.TLabel")
+        self.time_lbl.pack(side="left", padx=(10, 4))
+        self.sep(tb)
+        for text, cmd, tip in (("In", self.set_start, "Mark in  (I)"),
+                               ("Out", self.set_end, "Mark out  (O)"),
+                               ("Clear", self.clear_marks, "Clear in / out marks")):
+            self.btn(tb, text, cmd, style="ToolText.TButton", tip=tip).pack(side="left", padx=(0, 2))
+        self.sep(tb)
+        self.tool(tb, "cut", self.split, "Split at playhead  (Ctrl+B)")
+        self.tool(tb, "delete", self.delete_sel, "Delete  (Del)")
+        self.tool(tb, "ripple", lambda: self.delete_sel(True), "Ripple delete, closes the gap  (Shift+Del)")
+        self.tool(tb, "link", self.toggle_link, "Link / unlink selected clips")
+        self.sep(tb)
+        self.tool(tb, "undo", self.undo, "Undo  (Ctrl+Z)")
+        self.tool(tb, "redo", self.redo, "Redo  (Ctrl+Y)")
+        self.sep(tb)
+        self.tool(tb, "video", lambda: self.add_track("v"), "Add video track")
+        self.tool(tb, "music", lambda: self.add_track("a"), "Add audio track")
+        self.tool(tb, "add", self.add_media, "Import media  (Ctrl+I)")
+
+        for w in (self.btn(tb, ICON["fit"], self.zoom_fit, style="Tool.TButton",
+                           tip="Zoom to fit  (Shift+Z)"),
+                  self.btn(tb, ICON["zin"], lambda: self.zoom(1.5), style="Tool.TButton",
+                           tip="Zoom in  (+)"),
+                  self.btn(tb, ICON["zout"], lambda: self.zoom(1 / 1.5), style="Tool.TButton",
+                           tip="Zoom out  (−)")):
+            w.pack(side="right")
+        ttk.Separator(tb, orient="vertical").pack(side="right", fill="y", padx=8, pady=3)
+        self.pvol = tk.DoubleVar(value=self.settings.get("preview_volume", 100))
+        self.vol_cv = tk.Canvas(tb, width=64, height=24, bg=PANEL, highlightthickness=0,
+                                cursor="hand2")
+        self.vol_cv.pack(side="right", padx=(0, 4))
+        for ev in ("<ButtonPress-1>", "<B1-Motion>"):
+            self.vol_cv.bind(ev, lambda e: self.set_pvol(100 * (e.x - 7) / 50))
+        self.vol_cv.bind("<MouseWheel>",
+                         lambda e: self.set_pvol(self.pvol.get() + (5 if e.delta > 0 else -5)))
+        self.draw_pvol()
+        Tip(self.vol_cv, "Playback volume (preview only, not the export)")
+        for w in (self.toggle(tb, self.mute, None, "Mute preview sound", ("mute", "vol"),
+                              self.restart_if_playing),
+                  self.toggle(tb, self.loop, None, "Loop playback (in / out range)", ("loop", "loop")),
+                  self.toggle(tb, self.snap, "Snap", "Snap clips to edges and playhead  (N)")):
+            w.pack(side="right", padx=(2, 0))
+        self.range_lbl = ttk.Label(tb, text="", style="PanelMuted.TLabel", font=SMALL_FONT)
+        self.range_lbl.pack(side="right", padx=(0, 8))
+
+        self.hs = ttk.Scrollbar(panel, orient="horizontal", command=self.on_hscroll)
+        self.hs.pack(side="bottom", fill="x", pady=(2, 0))
+        self.vs = ttk.Scrollbar(panel, orient="vertical", command=self.on_vscroll)
+        self.vs.pack(side="right", fill="y", padx=(2, 0))
+        self.tl = tk.Canvas(panel, height=self.rows()[-1][3] + 40, bg=LANE, highlightthickness=0)
+        self.tl.pack(fill="both", expand=True)
+        self.tl.bind("<Configure>", lambda e: self.draw_timeline())
+        self.tl.bind("<ButtonPress-1>", self.on_tl_press)
+        self.tl.bind("<B1-Motion>", self.on_tl_drag)
+        self.tl.bind("<ButtonRelease-1>", self.on_tl_release)
+        self.tl.bind("<ButtonPress-3>", self.on_tl_right)
+        self.tl.bind("<Motion>", self.on_tl_hover)
+        self.tl.bind("<Leave>", lambda e: self.set_hover(None))
+        self.tl.bind("<MouseWheel>", self.on_tl_wheel)
+
+        for key, fn in (("<space>", lambda e: self.toggle_play()),
+                        ("<Left>", lambda e: self.step(-1)), ("<Right>", lambda e: self.step(1)),
+                        ("<Shift-Left>", lambda e: self.step(-5)),
+                        ("<Shift-Right>", lambda e: self.step(5)),
+                        ("<KeyPress-i>", lambda e: self.set_start()),
+                        ("<KeyPress-o>", lambda e: self.set_end()),
+                        ("<KeyPress-n>", lambda e: self.snap.set(not self.snap.get())),
+                        ("<KeyPress-Z>", lambda e: self.zoom_fit()),
+                        ("<KeyPress-plus>", lambda e: self.zoom(1.5)),
+                        ("<KeyPress-equal>", lambda e: self.zoom(1.5)),
+                        ("<KeyPress-minus>", lambda e: self.zoom(1 / 1.5)),
+                        ("<Home>", lambda e: self.seek(self.render_range()[0])),
+                        ("<End>", lambda e: self.seek(self.render_range()[1])),
+                        ("<Control-o>", lambda e: self.open_video()),
+                        ("<Control-i>", lambda e: self.add_media()),
+                        ("<Control-e>", lambda e: self.export()),
+                        ("<Control-t>", lambda e: self.post_tiktok()),
+                        ("<Control-a>", lambda e: self.select(c["id"] for c in self.clips)),
+                        ("<Control-b>", lambda e: self.split()),
+                        ("<Control-B>", lambda e: self.split()),
+                        ("<Delete>", lambda e: self.delete_sel()),
+                        ("<BackSpace>", lambda e: self.delete_sel()),
+                        ("<Shift-Delete>", lambda e: self.delete_sel(True)),
+                        ("<Shift-BackSpace>", lambda e: self.delete_sel(True)),
+                        ("<Control-z>", lambda e: self.undo()),
+                        ("<Control-y>", lambda e: self.redo()),
+                        ("<Control-Z>", lambda e: self.redo()),
+                        ("<Escape>", lambda e: self.select(set()))):
+            self.root.bind(key, self.guard(fn))
+        self.update_range()
+        self.setup_dnd()
+
+    def guard(self, fn):
+        def handler(e):
+            if isinstance(e.widget, (tk.Entry, ttk.Entry)) or self.export_proc:
+                return None
+            fn(e)
+            return "break"
+        return handler
+
+    # ---------- coordinates ----------
+    def layout(self):
+        cw, ch = max(self.cv.winfo_width(), 1), max(self.cv.winfo_height(), 1)
+        self.s = min(cw / self.vw, ch / self.vh)
+        self.dw, self.dh = max(2, int(self.vw * self.s)), max(2, int(self.vh * self.s))
+        self.ox, self.oy = (cw - self.dw) // 2, (ch - self.dh) // 2
+
+    def to_cv(self, x, y):
+        return self.ox + x * self.s, self.oy + y * self.s
+
+    def to_src(self, x, y):
+        return (x - self.ox) / self.s, (y - self.oy) / self.s
+
+    # ---------- drawing ----------
+    def redraw(self):
+        cv = self.cv
+        cv.delete("all")
+        if not self.vw:
+            cx, cy = cv.winfo_width() // 2, cv.winfo_height() // 2
+            cv.create_text(cx, cy - 12, text="Open a video to start", fill=FG,
+                           font=("Segoe UI Semibold", 15))
+            cv.create_text(cx, cy + 16, text="Add media puts more videos, images or audio on the "
+                                             "timeline. Drag clips onto V2 to layer them.",
+                           fill=MUTED, font=UI_FONT)
+            return
+        self.layout()
+
+        if self.frame is not None:
+            key = (id(self.frame), self.dw, self.dh)
+            if key != self.photo_key:
+                img = self.frame
+                if img.size != (self.dw, self.dh):
+                    img = img.resize((self.dw, self.dh), Image.BILINEAR)
+                self.frame_photo = ImageTk.PhotoImage(img)
+                self.photo_key = key
+            cv.create_image(self.ox, self.oy, image=self.frame_photo, anchor="nw")
+
+        x, y, w, h = self.crop
+        x1, y1 = self.to_cv(x, y)
+        x2, y2 = self.to_cv(x + w, y + h)
+        L, T, R, B = self.ox, self.oy, self.ox + self.dw, self.oy + self.dh
+        for r in ((L, T, R, y1), (L, y2, R, B), (L, y1, x1, y2), (x2, y1, R, y2)):
+            if r[2] > r[0] and r[3] > r[1]:
+                cv.create_rectangle(*r, fill="black", stipple="gray50", outline="")
+
+        tgt = self.preview_target()
+        if tgt:   # on-screen transform box of the selected clip (drag inside / corners)
+            pts = self.clip_corners(tgt)
+            cv.create_polygon(*[v for p in pts for v in p], outline="#ffffff", fill="", width=1,
+                              dash=(6, 3))
+            for hx, hy in pts:
+                cv.create_rectangle(hx - 5, hy - 5, hx + 5, hy + 5, fill="#ffffff",
+                                    outline="#000000")
+            cx, cy = self.to_cv(*self.clip_geom(tgt)[:2])
+            cv.create_line(cx - 7, cy, cx + 8, cy, fill="#ffffff")
+            cv.create_line(cx, cy - 7, cx, cy + 8, fill="#ffffff")
+        cv.create_rectangle(x1, y1, x2, y2, outline=ACCENT, width=2)
+        for hx, hy in ((x1, y1), (x2, y1), (x1, y2), (x2, y2)):
+            cv.create_rectangle(hx - HANDLE, hy - HANDLE, hx + HANDLE, hy + HANDLE,
+                                fill=ACCENT, outline="white")
+        ow, oh = self.output_dims()
+        tag = f"{int(w) // 2 * 2} x {int(h) // 2 * 2}"
+        if (ow, oh) != (int(w) // 2 * 2, int(h) // 2 * 2):
+            tag += f"  →  {ow} x {oh}"
+        t = cv.create_text(x1 + 10, y1 + 10, anchor="nw", fill="white", text=tag, font=UI_FONT)
+        bx = cv.bbox(t)
+        bg = cv.create_rectangle(bx[0] - 5, bx[1] - 3, bx[2] + 5, bx[3] + 3, fill="#000000",
+                                 stipple="gray50", outline="")
+        cv.tag_lower(bg, t)
+
+    def update_time(self):
+        self.time_lbl.config(text=f"{fmt_time(self.cur)} / {fmt_time(self.tl_end())}")
+
+    def update_range(self):
+        text = ""
+        if self.clips and (self.mark_in is not None or self.mark_out is not None):
+            rs, re = self.render_range()
+            text = f"{fmt_time(rs)} – {fmt_time(re)}  ({fmt_time(re - rs)})"
+        self.range_lbl.config(text=text)
+
+    # ---------- timeline model ----------
+    def new_id(self):
+        self.next_id += 1
+        return self.next_id
+
+    def tracks(self, kind):
+        return self.vtracks if kind == "v" else self.atracks
+
+    def tl_end(self):
+        return max((c["start"] + c["dur"] for c in self.clips), default=0.0)
+
+    def render_range(self):
+        end = self.tl_end()
+        rs = self.mark_in if self.mark_in is not None and self.mark_in < end else 0.0
+        re = self.mark_out if self.mark_out is not None and self.mark_out > rs else end
+        return rs, min(re, end)
+
+    def render_len(self):
+        rs, re = self.render_range()
+        return re - rs
+
+    def any_audio(self):
+        rs, re = self.render_range()
+        return any(c["kind"] == "a" and not self.atracks[c["track"]]["muted"]
+                   and c["start"] < re and c["start"] + c["dur"] > rs for c in self.clips)
+
+    def linked(self, c):
+        if not c["link"]:
+            return {c["id"]}
+        return {o["id"] for o in self.clips if o["link"] == c["link"]}
+
+    def by_id(self, i):
+        return next(c for c in self.clips if c["id"] == i)
+
+    def snapshot(self):
+        return copy.deepcopy((self.clips, self.vtracks, self.atracks))
+
+    def restore(self, snap):
+        self.clips, self.vtracks, self.atracks = copy.deepcopy(snap)
+        self.after_edit()
+
+    def commit(self, before):
+        self.undo_stack.append(before)
+        del self.undo_stack[:-100]
+        self.redo_stack.clear()
+        self.after_edit()
+
+    def undo(self):
+        if self.undo_stack:
+            self.pause()
+            self.redo_stack.append(self.snapshot())
+            self.restore(self.undo_stack.pop())
+
+    def redo(self):
+        if self.redo_stack:
+            self.pause()
+            self.undo_stack.append(self.snapshot())
+            self.restore(self.redo_stack.pop())
+
+    def after_edit(self):
+        self.sel &= {c["id"] for c in self.clips}
+        self.cur = min(self.cur, self.tl_end())
+        self.draw_timeline()
+        self.update_range()
+        self.update_time()
+        if not self.clips:
+            self.frame = None
+            self.redraw()
+        self.schedule_frame()
+
+    def clear_range(self, kind, track, s, e, keep):
+        """Overwrite: cut away whatever else sits on this track between s and e."""
+        for c in list(self.clips):
+            if c["kind"] != kind or c["track"] != track or c["id"] in keep:
+                continue
+            cs, ce = c["start"], c["start"] + c["dur"]
+            if ce <= s + 1e-6 or cs >= e - 1e-6:
+                continue
+            if cs >= s - 1e-6 and ce <= e + 1e-6:
+                self.clips.remove(c)
+            elif cs < s and ce > e:
+                self.clips.append(dict(c, id=self.new_id(), start=e, inp=c["inp"] + e - cs,
+                                       dur=ce - e, link=None))
+                c["dur"] = s - cs
+            elif cs < s:
+                c["dur"] = s - cs
+            else:
+                c["inp"] += e - cs
+                c["dur"] = ce - e
+                c["start"] = e
+
+    # ---------- timeline editing ----------
+    def add_track(self, kind):
+        before = self.snapshot()
+        self.tracks(kind).append({"hidden": False} if kind == "v" else {"muted": False})
+        self.commit(before)
+
+    def delete_track(self, kind, i):
+        if len(self.tracks(kind)) < 2:
+            return
+        self.pause()
+        before = self.snapshot()
+        del self.tracks(kind)[i]
+        self.clips = [c for c in self.clips if not (c["kind"] == kind and c["track"] == i)]
+        for c in self.clips:
+            if c["kind"] == kind and c["track"] > i:
+                c["track"] -= 1
+        self.commit(before)
+
+    def split(self):
+        t = self.cur
+        hit = [c for c in self.clips if c["start"] + 0.01 < t < c["start"] + c["dur"] - 0.01]
+        targets = [c for c in hit if c["id"] in self.sel] or hit
+        if not targets:
+            return
+        self.pause()
+        before = self.snapshot()
+        newlink = {}
+        for c in targets:
+            k = t - c["start"]
+            link = newlink.setdefault(c["link"], self.new_id()) if c["link"] else None
+            self.clips.append(dict(c, id=self.new_id(), start=t, inp=c["inp"] + k,
+                                   dur=c["dur"] - k, link=link))
+            c["dur"] = k
+        self.commit(before)
+
+    def delete_sel(self, ripple=False):
+        gone = [c for c in self.clips if c["id"] in self.sel]
+        if not gone:
+            return
+        self.pause()
+        before = self.snapshot()
+        self.clips = [c for c in self.clips if c["id"] not in self.sel]
+        if ripple:
+            for g in sorted(gone, key=lambda c: c["start"], reverse=True):
+                for c in self.clips:
+                    if (c["kind"], c["track"]) == (g["kind"], g["track"]) \
+                            and c["start"] >= g["start"] + g["dur"] - 1e-6:
+                        c["start"] -= g["dur"]
+            self.cur = min(gone, key=lambda c: c["start"])["start"]
+        self.sel.clear()
+        self.commit(before)
+
+    def toggle_link(self):
+        chosen = [c for c in self.clips if c["id"] in self.sel]
+        if not chosen:
+            return
+        before = self.snapshot()
+        if any(c["link"] for c in chosen):
+            for c in chosen:
+                c["link"] = None
+        else:
+            link = self.new_id()
+            for c in chosen:
+                c["link"] = link
+        self.commit(before)
+
+    def select(self, ids):
+        self.sel = set(ids)
+        self.draw_timeline()
+
+    # ---------- inspector ----------
+    # (key, label, low, high, step per pixel when dragging the value, format, slider?)
+    INSPECTOR = {
+        "v": [("Transform", [("zoom", "Zoom", 0.05, 4.0, 0.005, "{:.3f}", True),
+                             ("pos_x", "Position X", -10000, 10000, 1, "{:.0f}", False),
+                             ("pos_y", "Position Y", -10000, 10000, 1, "{:.0f}", False),
+                             ("rotation", "Rotation", -180, 180, 0.5, "{:.1f}°", True)]),
+              ("Cropping", [("crop_l", "Left", 0, 49, 0.2, "{:.1f}%", True),
+                            ("crop_r", "Right", 0, 49, 0.2, "{:.1f}%", True),
+                            ("crop_t", "Top", 0, 49, 0.2, "{:.1f}%", True),
+                            ("crop_b", "Bottom", 0, 49, 0.2, "{:.1f}%", True)]),
+              ("Composite", [("opacity", "Opacity", 0, 100, 0.5, "{:.0f}%", True)]),
+              ("Fade", [("fade_in", "Fade in", 0, 10, 0.02, "{:.2f} s", True),
+                        ("fade_out", "Fade out", 0, 10, 0.02, "{:.2f} s", True)])],
+        "a": [("Audio", [("volume", "Volume", -60, 12, 0.1, "{:+.1f} dB", True),
+                         ("pan", "Pan", -1, 1, 0.01, "{:+.2f}", True)]),
+              ("Fade", [("fade_in", "Fade in", 0, 10, 0.02, "{:.2f} s", True),
+                        ("fade_out", "Fade out", 0, 10, 0.02, "{:.2f} s", True)])],
+    }
+
+    def build_inspector(self):
+        box = ttk.Frame(self.hpane, style="Panel.TFrame", padding=(12, 8, 4, 8))
+        self.hpane.add(box, minsize=280, width=380, stretch="never")
+        self.insp_kind = "v"          # tab shown: "v" (video / image) or "a"
+        self.insp_focus = None        # id of the clip last clicked
+        self.insp_before = self.insp_job = self.insp_sig = self.insp_shown = None
+        head = ttk.Frame(box, style="Panel.TFrame")
+        head.pack(fill="x")
+        ttk.Label(head, text="Inspector", style="Panel.TLabel",
+                  font=("Segoe UI Semibold", 11)).pack(side="left")
+        self.insp_tabs = {}
+        for kind in ("a", "v"):
+            self.insp_tabs[kind] = self.btn(head, "", lambda k=kind: self.set_insp_tab(k),
+                                            style="ToolText.TButton")
+        self.insp_name = ttk.Label(box, text="", style="PanelMuted.TLabel", font=SMALL_FONT)
+        self.insp_name.pack(anchor="w", pady=(2, 6))
+        self.insp_empty = ttk.Label(box, text="Click a clip on the timeline or in the preview "
+                                              "to edit it.",
+                                    style="PanelMuted.TLabel", wraplength=300, justify="left")
+        self.insp_empty.pack(anchor="w")
+        wrap = ttk.Frame(box, style="Panel.TFrame")
+        wrap.pack(fill="both", expand=True)
+        self.insp_cv = tk.Canvas(wrap, bg=PANEL, highlightthickness=0, width=300)
+        sb = ttk.Scrollbar(wrap, orient="vertical", command=self.insp_cv.yview)
+        self.insp_cv.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self.insp_cv.pack(side="left", fill="both", expand=True)
+        self.insp_body, self.fields = {}, {}
+        for kind, groups in self.INSPECTOR.items():
+            body = ttk.Frame(self.insp_cv, style="Panel.TFrame", padding=(0, 0, 10, 0))
+            body.columnconfigure(1, weight=1)
+            r = 0
+            for title, rows in groups:
+                ttk.Label(body, text=title, style="Panel.TLabel", foreground=ACCENT,
+                          font=("Segoe UI Semibold", 10)).grid(row=r, column=0, columnspan=4,
+                                                               sticky="w", pady=(10 if r else 0, 2))
+                r += 1
+                for key, label, lo, hi, step, fmt, slider in rows:
+                    self.fields[(kind, key)] = SlideField(
+                        body, r, label, lo, hi, step, fmt, CLIP_DEFAULTS[key],
+                        lambda v, k=kind, key=key: self.insp_set(k, key, v), self.insp_end,
+                        slider)
+                    r += 1
+                if kind == "v" and title == "Transform":
+                    ttk.Label(body, text="Flip", style="PanelMuted.TLabel").grid(row=r, column=0,
+                                                                                 sticky="w")
+                    fl = ttk.Frame(body, style="Panel.TFrame")
+                    fl.grid(row=r, column=1, columnspan=3, sticky="w", pady=(2, 0))
+                    for key, text in (("flip_h", "Horizontal"), ("flip_v", "Vertical")):
+                        var = tk.BooleanVar()
+                        ttk.Checkbutton(fl, text=text, variable=var, style="Panel.TCheckbutton",
+                                        takefocus=False,
+                                        command=lambda k=key, v=var: (self.insp_set("v", k, v.get()),
+                                                                      self.insp_end())
+                                        ).pack(side="left", padx=(0, 12))
+                        self.fields[("v", key)] = var
+                    r += 1
+            self.btn(body, "Reset all", lambda k=kind: self.insp_reset(k),
+                     style="ToolText.TButton").grid(row=r, column=0, columnspan=4, sticky="w",
+                                                    pady=(12, 4))
+            self.insp_body[kind] = body
+        self.insp_win = self.insp_cv.create_window(0, 0, anchor="nw")
+        self.insp_cv.bind("<Configure>",
+                          lambda e: self.insp_cv.itemconfig(self.insp_win, width=e.width))
+        self.insp_cv.bind_all("<MouseWheel>", self.on_insp_wheel, add="+")
+        self.refresh_inspector(force=True)
+
+    def on_insp_wheel(self, e):
+        w = e.widget
+        while w is not None and w is not self.insp_cv:
+            if isinstance(w, tk.Canvas) and w is not self.insp_cv or isinstance(w, tk.Label) \
+                    and str(w.cget("cursor")) == "sb_h_double_arrow":
+                return   # a slider / value box under the mouse takes the wheel itself
+            w = getattr(w, "master", None)
+        if w is self.insp_cv:
+            self.insp_cv.yview_scroll(-e.delta // 120, "units")
+
+    def insp_clips(self, kind):
+        """Selected clips the inspector edits on this tab; the clicked one comes first."""
+        chosen = [c for c in self.clips if c["id"] in self.sel and c["kind"] == kind]
+        chosen.sort(key=lambda c: c["id"] != self.insp_focus)
+        return chosen
+
+    def set_insp_tab(self, kind):
+        self.insp_kind = kind
+        self.refresh_inspector(force=True)
+
+    def insp_signature(self):
+        clips = self.insp_clips(self.insp_kind)
+        return (tuple(sorted(self.sel)), self.insp_kind, self.insp_focus,
+                tuple(sorted(clips[0].items())) if clips else None)
+
+    def refresh_inspector(self, force=False):
+        kinds = [k for k in ("v", "a") if self.insp_clips(k)]
+        if kinds and self.insp_kind not in kinds:
+            self.insp_kind = kinds[0]
+        sig = self.insp_signature()
+        if sig == self.insp_sig and not force:
+            return
+        self.insp_sig = sig
+        clips = self.insp_clips(self.insp_kind)
+        for kind, b in self.insp_tabs.items():
+            if kind in kinds:
+                vc = self.insp_clips("v")
+                image = kind == "v" and self.media.get(vc[0]["path"], {}).get("image")
+                b.config(text="Image" if image else ("Video" if kind == "v" else "Audio"),
+                         style="ToolTextOn.TButton" if kind == self.insp_kind else "ToolText.TButton")
+                b.pack(side="right", padx=(2, 0))
+            else:
+                b.pack_forget()
+        if not clips:
+            if self.insp_shown is not None:
+                self.insp_cv.itemconfig(self.insp_win, window="")
+                self.insp_shown = None
+            self.insp_name.config(text="")
+            self.insp_empty.pack(anchor="w", after=self.insp_name)
+            return
+        self.insp_empty.pack_forget()
+        c = clips[0]
+        more = f"   (+{len(clips) - 1} more)" if len(clips) > 1 else ""
+        self.insp_name.config(text=Path(c["path"]).name[:40] + more)
+        if self.insp_shown != self.insp_kind:   # layout work only when the tab changes
+            body = self.insp_body[self.insp_kind]
+            self.insp_cv.itemconfig(self.insp_win, window=body)
+            body.update_idletasks()
+            self.insp_cv.configure(scrollregion=(0, 0, 0, body.winfo_reqheight()))
+            self.insp_shown = self.insp_kind
+        for (kind, key), f in self.fields.items():
+            if kind != self.insp_kind:
+                continue
+            if isinstance(f, tk.BooleanVar):
+                f.set(bool(cp(c, key)))
+                continue
+            if key in ("fade_in", "fade_out"):
+                f.hi = max(0.1, min(10.0, c["dur"]))
+            f.show(cp(c, key))
+
+    def set_prop(self, c, key, value):
+        if value == CLIP_DEFAULTS[key]:
+            c.pop(key, None)
+        else:
+            c[key] = value
+
+    def insp_set(self, kind, key, value):
+        """Writes a setting to the selected clips of this kind. A run of changes (a slider drag)
+        becomes one undo step, closed by insp_end() or 500 ms of quiet."""
+        clips = self.insp_clips(kind)
+        if not clips:
+            return
+        if isinstance(CLIP_DEFAULTS[key], float):
+            value = float(value)
+            if key in ("fade_in", "fade_out"):
+                value = min(max(value, 0.0), min(c["dur"] for c in clips))
+        if self.insp_before is None:
+            self.insp_before = self.snapshot()
+        for c in clips:
+            self.set_prop(c, key, value)
+        self.insp_sig = self.insp_signature()   # the field already shows it; no full refresh
+        if self.insp_job:
+            self.root.after_cancel(self.insp_job)
+        self.insp_job = self.root.after(500, self.insp_commit)
+        if key in ("volume", "fade_in", "fade_out"):   # the only settings drawn on the timeline
+            self.draw_timeline()
+        if self.player:
+            # restarting playback on every slider step would stall it; wait until it rests
+            if self.replay_job:
+                self.root.after_cancel(self.replay_job)
+            self.replay_job = self.root.after(300, self.replay)
+        elif kind == "v":
+            self.queue_live()
+
+    def insp_end(self):
+        """A slider / value drag ended: close the undo step and fetch the exact frame."""
+        if self.insp_job:
+            self.root.after_cancel(self.insp_job)
+        self.insp_commit()
+        if not self.player:
+            self.schedule_frame(150)
+
+    def queue_live(self):
+        if not self.live_job:
+            self.live_job = self.root.after_idle(self.run_live)
+
+    def replay(self):
+        self.replay_job = None
+        self.restart_if_playing()
+
+    def run_live(self):
+        """Instant preview while something moves; the exact FFmpeg frame follows when it rests."""
+        self.live_job = None
+        self.live_preview()
+        self.schedule_frame(450)
+
+    def insp_commit(self):
+        self.insp_job = None
+        if self.insp_before is not None:
+            before, self.insp_before = self.insp_before, None
+            self.undo_stack.append(before)
+            del self.undo_stack[:-100]
+            self.redo_stack.clear()
+
+    def insp_reset(self, kind):
+        clips = self.insp_clips(kind)
+        if not clips:
+            return
+        before = self.snapshot()
+        keys = {k for _, rows in self.INSPECTOR[kind] for k, *_ in rows}
+        keys |= {"flip_h", "flip_v"} if kind == "v" else set()
+        for c in clips:
+            for k in keys:
+                c.pop(k, None)
+        self.commit(before)
+        self.refresh_inspector(force=True)
+
+    # ---------- timeline geometry ----------
+    def rows(self):
+        """(kind, track, y0, y1) top to bottom: video tracks highest first, then audio.
+        Scrolled by yoff; rows above the ruler are hidden under it."""
+        out, y = [], RULER_H - self.yoff
+        for kind, i in ([("v", i) for i in range(len(self.vtracks) - 1, -1, -1)] +
+                        [("a", i) for i in range(len(self.atracks))]):
+            h = self.track_h(kind, i)
+            out.append((kind, i, y, y + h))
+            y += h
+        return out
+
+    def track_h(self, kind, i):
+        return self.tracks(kind)[i].get("h", VT_H if kind == "v" else AT_H)
+
+    def height_edge(self, x, y):
+        """Track whose bottom border in the header column is under the mouse (drag to resize)."""
+        if x >= HEAD_W or y < RULER_H:
+            return None
+        return next((r for r in self.rows() if abs(y - r[3]) <= 3), None)
+
+    def row_at(self, y):
+        if y < RULER_H:
+            return None
+        return next((r for r in self.rows() if r[2] <= y < r[3]), None)
+
+    def max_yoff(self):
+        content = sum(r[3] - r[2] for r in self.rows())
+        return max(0.0, content - (self.tl.winfo_height() - RULER_H))
+
+    def row_of(self, kind, i):
+        return next(r for r in self.rows() if r[0] == kind and r[1] == i)
+
+    def t2x(self, t):
+        return HEAD_W + (t - self.view_t) * self.pps
+
+    def x2t(self, x):
+        return self.view_t + (x - HEAD_W) / self.pps
+
+    def vis_secs(self):
+        return max(self.tl.winfo_width() - HEAD_W, 1) / self.pps
+
+    def pill_box(self, y0, y1):
+        mid, r = (y0 + y1) // 2, min(10, (y1 - y0 - 6) // 2)
+        return HEAD_W - 36, mid - r, HEAD_W - 8, mid + r
+
+    def clip_at(self, x, y):
+        r = self.row_at(y)
+        if not r or x < HEAD_W:
+            return None, None
+        # exact hit first, so at a cut the clip under the mouse wins over its neighbour
+        for slack in (0, 2):
+            for c in reversed(self.clips):
+                if (c["kind"], c["track"]) != r[:2]:
+                    continue
+                x0, x1 = self.t2x(c["start"]), self.t2x(c["start"] + c["dur"])
+                if x0 - slack <= x <= x1 + slack:
+                    edge = min(EDGE, (x1 - x0) / 4)
+                    if x - x0 <= edge:
+                        return c, "left"
+                    if x1 - x <= edge:
+                        return c, "right"
+                    return c, "move"
+        return None, None
+
+    # ---------- timeline drawing ----------
+    def draw_timeline(self):
+        c = self.tl
+        c.delete("all")
+        w, h = max(c.winfo_width(), 1), max(c.winfo_height(), 1)
+        self.yoff = min(max(self.yoff, 0.0), self.max_yoff())
+        rows = self.rows()
+        for kind, i, y0, y1 in rows:
+            c.create_line(HEAD_W, y1 - 1, w, y1 - 1, fill=BORDER)
+        c.create_line(HEAD_W, rows[len(self.vtracks) - 1][3] - 1, w,
+                      rows[len(self.vtracks) - 1][3] - 1, fill=MUTED)
+
+        for cl in self.clips:
+            x0, x1 = self.t2x(cl["start"]), self.t2x(cl["start"] + cl["dur"])
+            if x1 < HEAD_W or x0 > w:
+                continue
+            _, _, y0, y1 = self.row_of(cl["kind"], cl["track"])
+            x0 = max(x0, HEAD_W)
+            video = cl["kind"] == "v"
+            tr = self.tracks(cl["kind"])[cl["track"]]
+            off = tr.get("hidden") or tr.get("muted")
+            sel = cl["id"] in self.sel
+            X0 = self.t2x(cl["start"])
+            cy0, cy1 = y0 + 2, y1 - 3
+            c.create_rectangle(x0 + 1, cy0, x1 - 1, cy1, fill=CLIP_V if video else CLIP_A,
+                               outline="")
+            name_h = 14 if cy1 - cy0 >= 30 else 0
+            if video:
+                self.draw_thumbs(cl, X0, x0 + 1, min(x1 - 1, w), cy0, cy1 - name_h)
+            else:
+                self.draw_wave(cl, X0, x0 + 1, min(x1 - 1, w), cy0, cy1 - name_h)
+            for fade, a, b in (("fade_in", cl["start"], cl["start"] + cp(cl, "fade_in")),
+                               ("fade_out", cl["start"] + cl["dur"],
+                                cl["start"] + cl["dur"] - cp(cl, "fade_out"))):
+                if cp(cl, fade):
+                    xa, xb = self.t2x(a), self.t2x(b)
+                    c.create_polygon(xa, cy0, xb, cy0, xa, cy1, fill="#000000", stipple="gray50",
+                                     outline="")
+            if name_h:
+                c.create_rectangle(x0 + 1, cy1 - name_h, x1 - 1, cy1,
+                                   fill=CLIP_V_D if video else CLIP_A_D, outline="")
+            if off:
+                c.create_rectangle(x0 + 1, cy0, x1 - 1, cy1, fill="#000000", stipple="gray50",
+                                   outline="")
+            c.create_rectangle(x0 + 1, cy0, x1 - 1, cy1, outline="white" if sel else
+                               (CLIP_V_D if video else CLIP_A_D), width=2 if sel else 1)
+            if self.hover and self.hover[0] == cl["id"]:
+                # trim handles: drag either end to make the clip shorter / longer
+                for side, hx in (("left", x0 + 1), ("right", x1 - 6)):
+                    if side == "left" and x0 > self.t2x(cl["start"]) + 1:
+                        continue
+                    hot = self.hover[1] == side
+                    c.create_rectangle(hx, y0 + 2, hx + 5, y1 - 3, outline="",
+                                       fill="#ffcc00" if hot else "#d8d8e0")
+            room = int((x1 - x0 - 12) / 6.5)
+            if room > 2 and y1 - y0 >= 20:
+                label = f"{Path(cl['path']).name}   {fmt_time(cl['dur'])}"
+                if cl["link"]:
+                    label = "🔗 " + label
+                if len(label) > room:
+                    label = label[:max(room - 1, 1)] + "…"
+                c.create_text(x0 + 6, cy1 - (name_h or cy1 - cy0) / 2, anchor="w", text=label,
+                              fill="white", font=SMALL_FONT)
+
+        self.draw_drop(rows)
+        self.refresh_inspector()
+
+        c.create_rectangle(0, 0, HEAD_W, h, fill=HEAD_BG, outline="")
+        for kind, i, y0, y1 in rows:
+            tr = self.tracks(kind)[i]
+            mid = (y0 + y1) // 2
+            c.create_line(0, y1 - 1, HEAD_W, y1 - 1, fill=BORDER)
+            tall = y1 - y0 >= 34
+            c.create_text(10, mid - 7 if tall else mid, anchor="w", text=f"{kind.upper()}{i + 1}",
+                          fill=FG, font=("Segoe UI Semibold", 10))
+            if tall:
+                n = sum(1 for cl in self.clips if (cl["kind"], cl["track"]) == (kind, i))
+                c.create_text(10, mid + 8, anchor="w", text=f"{n} clip{'' if n == 1 else 's'}",
+                              fill=MUTED, font=SMALL_FONT)
+            px0, py0, px1, py1 = self.pill_box(y0, y1)
+            if kind == "v":
+                off = tr["hidden"]
+                fill, icon = ("#5a2a2a", ICON["hide"]) if off else (FIELD, ICON["eye"])
+            else:
+                off = tr["muted"]
+                fill, icon = ("#b04040", ICON["mute"]) if off else (FIELD, ICON["vol"])
+            c.create_rectangle(px0, py0, px1, py1, fill=fill, outline=BORDER)
+            c.create_text((px0 + px1) / 2, (py0 + py1) / 2, text=icon, fill=FG, font=(ICON_FONT, 9))
+        c.create_line(HEAD_W, 0, HEAD_W, h, fill=BORDER)
+
+        # ruler last, so tracks scrolled up slide under it
+        c.create_rectangle(0, 0, w, RULER_H, fill=BG, outline="")
+        step = next((s for s in TICKS if s * self.pps >= 80), TICKS[-1])
+        k = math.floor(self.view_t / step)
+        while True:
+            t = k * step
+            x = self.t2x(t)
+            if x > w:
+                break
+            if x >= HEAD_W:
+                c.create_line(x, RULER_H - 8, x, RULER_H, fill=MUTED)
+                c.create_text(x + 3, 2, anchor="nw", text=tc(t, step), fill=MUTED, font=SMALL_FONT)
+            xm = self.t2x(t + step / 2)
+            if HEAD_W <= xm <= w:
+                c.create_line(xm, RULER_H - 4, xm, RULER_H, fill=BORDER)
+            k += 1
+        if self.clips and (self.mark_in is not None or self.mark_out is not None):
+            rs, re = self.render_range()
+            xa, xb = max(self.t2x(rs), HEAD_W), min(self.t2x(re), w)
+            if xb > xa:
+                c.create_rectangle(xa, RULER_H - 5, xb, RULER_H, fill=ACCENT, outline="")
+        c.create_rectangle(0, 0, HEAD_W, RULER_H, fill=HEAD_BG, outline="")
+        c.create_line(0, RULER_H - 1, w, RULER_H - 1, fill=BORDER)
+        c.create_text(10, RULER_H // 2, anchor="w", text=fmt_time(self.cur), fill=FG,
+                      font=("Consolas", 10), tags="tc")
+        self.draw_playhead()
+        self.update_scrollbar()
+
+    def draw_thumbs(self, cl, X0, x0, x1, y0, y1):
+        """Filmstrip: tiles anchored to the clip start, each showing the frame under its middle."""
+        info = self.thumbs.get(cl["path"])
+        th = int(y1 - y0)
+        if not info or not info[1] or th < 14:
+            return
+        step, imgs = info
+        tw = max(8, round(th * imgs[0].width / imgs[0].height))
+        x = X0 + max(0, int((x0 - X0) // tw)) * tw
+        while x < x1:
+            if x + tw <= x0:
+                x += tw
+                continue
+            t = cl["inp"] + (x + tw / 2 - X0) / self.pps
+            idx = 0 if not step else min(len(imgs) - 1, max(0, int(t / step)))
+            left, right = max(0, int(x0 - x)), int(min(tw, x1 - x))
+            if right - left >= 2:
+                key = (cl["path"], idx, tw, th, left, right)
+                ph = self.tiles.get(key)
+                if ph is None:
+                    if len(self.tiles) > 800:
+                        self.tiles.clear()
+                    im = imgs[idx].resize((tw, th), Image.BILINEAR).crop((left, 0, right, th))
+                    ph = self.tiles[key] = ImageTk.PhotoImage(im)
+                self.tl.create_image(x + left, y0, image=ph, anchor="nw")
+            x += tw
+
+    def draw_wave(self, cl, X0, x0, x1, y0, y1):
+        """Mirrored waveform, scaled by the clip's volume."""
+        pk = self.peaks.get(cl["path"])
+        if not pk or y1 - y0 < 8:
+            return
+        mid, half = (y0 + y1) / 2, (y1 - y0) / 2 - 1
+        gain = 10 ** (cp(cl, "volume") / 20)
+        top, bottom = [], []
+        for x in range(int(x0), int(x1) + 1, 2):
+            ta = cl["inp"] + (x - X0) / self.pps
+            i0 = max(0, int(ta * PEAKS_PER_SEC))
+            i1 = max(i0 + 1, int((ta + 2 / self.pps) * PEAKS_PER_SEC))
+            v = min(1.0, max(pk[i0:i1], default=0) / 255 * gain) * half
+            top += (x, mid - v - 0.5)
+            bottom[:0] = (x, mid + v + 0.5)
+        if len(top) >= 4:
+            self.tl.create_polygon(*top, *bottom, fill="#86e0ad", outline="")
+
+    def draw_drop(self, rows):
+        """Where dragged-in files will land: one ghost clip per file and track, plus an insert line."""
+        if not (self.drop and self.drop.get("target")):
+            return
+        c = self.tl
+        t, track = self.drop["target"]
+        c.create_line(self.t2x(t), RULER_H, self.t2x(t), c.winfo_height(), fill=ACCENT, width=2)
+        for path in self.drop["paths"]:
+            m = self.media.get(path)
+            dur = self.drop_dur(path)
+            kinds = ([k for k, has in (("v", m["video"]), ("a", m["audio"])) if has] if m
+                     else [self.drop["kind"]])
+            for kind in kinds:
+                if track < len(self.tracks(kind)):
+                    _, _, y0, y1 = self.row_of(kind, track)
+                elif kind == "v":   # a new track will be added above the top one
+                    y1 = rows[0][2]
+                    y0 = y1 - VT_H
+                else:               # ... or below the last audio track
+                    y0 = rows[-1][3]
+                    y1 = y0 + AT_H
+                x0, x1 = self.t2x(t), self.t2x(t + dur)
+                c.create_rectangle(x0 + 1, y0 + 2, x1 - 1, y1 - 3, fill=ACCENT, stipple="gray25",
+                                   outline=ACCENT, width=2, dash=(4, 2))
+                if x1 - x0 > 30 and y1 - y0 >= 20:
+                    c.create_text(x0 + 8, y0 + 5, anchor="nw", fill="white", font=SMALL_FONT,
+                                  text=Path(path).name if m else Path(path).name + "  …")
+            t += dur
+
+    def draw_playhead(self):
+        c = self.tl
+        c.delete("ph")
+        c.itemconfig("tc", text=fmt_time(self.cur))
+        x = self.t2x(self.cur)
+        if not self.clips or x < HEAD_W:
+            return
+        c.create_line(x, RULER_H - 4, x, c.winfo_height(), fill=PLAYHEAD, width=2, tags="ph")
+        c.create_polygon(x - 9, 1, x + 9, 1, x + 9, RULER_H - 9, x, RULER_H, x - 9, RULER_H - 9,
+                         fill=PLAYHEAD, outline="#ffffff", width=1, tags="ph")
+
+    def follow_playhead(self):
+        x = self.t2x(self.cur)
+        if x < HEAD_W or x > self.tl.winfo_width() - 20:
+            self.view_t = max(0.0, self.cur - self.vis_secs() * 0.1)
+            self.draw_timeline()
+        else:
+            self.draw_playhead()
+
+    def scroll_total(self):
+        return max(self.tl_end(), self.view_t) + self.vis_secs()
+
+    def update_scrollbar(self):
+        total = self.scroll_total()
+        self.hs.set(self.view_t / total, (self.view_t + self.vis_secs()) / total)
+        vis = max(self.tl.winfo_height() - RULER_H, 1)
+        content = vis + self.max_yoff()
+        self.vs.set(self.yoff / content, (self.yoff + vis) / content)
+
+    def on_vscroll(self, *args):
+        vis = max(self.tl.winfo_height() - RULER_H, 1)
+        if args[0] == "moveto":
+            self.yoff = float(args[1]) * (vis + self.max_yoff())
+        elif args[0] == "scroll":
+            self.yoff += int(args[1]) * (AT_H if args[2] == "units" else vis * 0.9)
+        self.draw_timeline()
+
+    def on_hscroll(self, *args):
+        vis = self.vis_secs()
+        if args[0] == "moveto":
+            self.view_t = float(args[1]) * self.scroll_total()
+        elif args[0] == "scroll":
+            self.view_t += int(args[1]) * vis * (0.1 if args[2] == "units" else 0.9)
+        self.view_t = max(0.0, self.view_t)
+        self.draw_timeline()
+
+    def zoom(self, f, x=None):
+        x = x if x is not None else (self.t2x(self.cur) if self.clips else HEAD_W)
+        t = self.x2t(x)
+        self.pps = min(max(self.pps * f, 1.0), 600.0)
+        self.view_t = max(0.0, t - (x - HEAD_W) / self.pps)
+        self.draw_timeline()
+
+    def zoom_fit(self):
+        self.pps = min(max((self.tl.winfo_width() - HEAD_W - 30) / max(self.tl_end(), 1.0), 1.0),
+                       600.0)
+        self.view_t = 0.0
+        self.draw_timeline()
+
+    def on_tl_wheel(self, e):
+        if e.state & 0x0004:
+            self.zoom(1.25 if e.delta > 0 else 0.8, max(e.x, HEAD_W))
+        elif e.state & 0x0001 or e.x < HEAD_W:
+            self.yoff -= e.delta / 120 * AT_H
+            self.draw_timeline()
+        else:
+            self.view_t = max(0.0, self.view_t - e.delta / 120 * 60 / self.pps)
+            self.draw_timeline()
+
+    # ---------- timeline mouse ----------
+    def on_tl_hover(self, e):
+        if self.tdrag:
+            return
+        cursor, hover = "", None
+        if self.height_edge(e.x, e.y):
+            cursor = "sb_v_double_arrow"
+        elif e.y >= RULER_H and e.x < HEAD_W:
+            r = self.row_at(e.y)
+            if r:
+                px0, py0, px1, py1 = self.pill_box(r[2], r[3])
+                cursor = "hand2" if px0 <= e.x <= px1 and py0 <= e.y <= py1 else ""
+        elif e.y < RULER_H:
+            cursor = "hand2"
+        else:
+            cl, part = self.clip_at(e.x, e.y)
+            cursor = {"left": "sb_h_double_arrow", "right": "sb_h_double_arrow",
+                      "move": "fleur"}.get(part, "")
+            hover = cl and (cl["id"], part)
+        self.tl.config(cursor=cursor)
+        self.set_hover(hover)
+
+    def set_hover(self, hover):
+        if hover != self.hover and not self.tdrag:
+            self.hover = hover
+            self.draw_timeline()
+
+    def on_tl_press(self, e):
+        self.root.focus_set()
+        self.tdrag = None
+        r = self.height_edge(e.x, e.y)
+        if r:
+            self.tdrag = {"mode": "height", "kind": r[0], "i": r[1], "y": e.y,
+                          "h0": r[3] - r[2]}
+            return
+        if not self.clips:
+            return
+        if e.y < RULER_H:
+            if e.x >= HEAD_W:
+                self.resume = self.player is not None
+                self.pause()
+                self.tdrag = {"mode": "scrub"}
+                self.seek(self.x2t(e.x))
+            return
+        if e.x < HEAD_W:
+            r = self.row_at(e.y)
+            if r:
+                px0, py0, px1, py1 = self.pill_box(r[2], r[3])
+                if px0 <= e.x <= px1 and py0 <= e.y <= py1:
+                    tr = self.tracks(r[0])[r[1]]
+                    key = "hidden" if r[0] == "v" else "muted"
+                    tr[key] = not tr[key]
+                    self.restart_if_playing()
+                    self.after_edit()
+            return
+        cl, part = self.clip_at(e.x, e.y)
+        additive = e.state & 0x0005
+        if not cl:
+            if not additive:
+                self.sel.clear()
+            self.resume = self.player is not None
+            self.pause()
+            self.tdrag = {"mode": "scrub"}
+            self.seek(self.x2t(e.x))
+            self.draw_timeline()
+            return
+        if cl["id"] != self.insp_focus:
+            self.insp_commit()   # edits to the previous clip are their own undo step
+        self.insp_focus, self.insp_kind = cl["id"], cl["kind"]
+        self.root.after_idle(self.prefetch_sources)
+        group = {cl["id"]} if e.state & 0x20000 else self.linked(cl)
+        if additive:
+            if cl["id"] in self.sel:
+                self.sel -= group
+                self.draw_timeline()
+                return
+            self.sel |= group
+        elif cl["id"] not in self.sel:
+            self.sel = set(group)
+        self.draw_timeline()
+        self.tdrag = {"mode": part, "id": cl["id"], "x": e.x, "y": e.y, "moved": False,
+                      "before": self.snapshot(),
+                      "orig": {i: dict(self.by_id(i)) for i in self.sel}}
+
+    def snap_points(self, skip):
+        pts = [0.0, self.cur]
+        pts += [m for m in (self.mark_in, self.mark_out) if m is not None]
+        for c in self.clips:
+            if c["id"] not in skip:
+                pts += [c["start"], c["start"] + c["dur"]]
+        return pts
+
+    def snap_delta(self, edges, skip):
+        if not self.snap.get():
+            return 0.0
+        best = None
+        for p in self.snap_points(skip):
+            for edge in edges:
+                d = p - edge
+                if abs(d) * self.pps <= SNAP_PX and (best is None or abs(d) < abs(best)):
+                    best = d
+        return best or 0.0
+
+    def on_tl_drag(self, e):
+        d = self.tdrag
+        if not d:
+            return
+        if d["mode"] == "scrub":
+            self.seek(self.x2t(e.x))
+            return
+        if d["mode"] == "height":
+            h = min(max(d["h0"] + e.y - d["y"], TRACK_MIN_H), TRACK_MAX_H)
+            self.tracks(d["kind"])[d["i"]]["h"] = h
+            self.draw_timeline()
+            return
+        if not d["moved"] and abs(e.x - d["x"]) < 3 and abs(e.y - d["y"]) < 3:
+            return
+        if not d["moved"]:
+            d["moved"] = True
+            self.pause()
+        dt = (e.x - d["x"]) / self.pps
+        orig = d["orig"]
+        me = orig[d["id"]]
+        if d["mode"] == "move":
+            lo = -min(o["start"] for o in orig.values())
+            dt = max(dt, lo)
+            dt += self.snap_delta((me["start"] + dt, me["start"] + me["dur"] + dt), orig)
+            dt = max(dt, lo)
+            r = self.row_at(e.y)
+            dtrack = r[1] - me["track"] if r and r[0] == me["kind"] else 0
+            n = len(self.tracks(me["kind"]))
+            if any(not 0 <= o["track"] + dtrack < n for o in orig.values() if o["kind"] == me["kind"]):
+                dtrack = 0
+            for i, o in orig.items():
+                c = self.by_id(i)
+                c["start"] = o["start"] + dt
+                c["track"] = o["track"] + (dtrack if o["kind"] == me["kind"] else 0)
+        else:
+            ids = [i for i in self.linked(self.by_id(d["id"])) if i in orig] or [d["id"]]
+            lo, hi = -1e9, 1e9
+            for i in ids:
+                o = orig[i]
+                image = self.media[o["path"]]["image"]
+                if d["mode"] == "left":
+                    hi = min(hi, o["dur"] - MIN_CLIP)
+                    lo = max(lo, -o["start"], -1e9 if image else -o["inp"])
+                else:
+                    lo = max(lo, MIN_CLIP - o["dur"])
+                    if not image:
+                        hi = min(hi, self.media[o["path"]]["dur"] - o["inp"] - o["dur"])
+            edge = me["start"] if d["mode"] == "left" else me["start"] + me["dur"]
+            dt += self.snap_delta((edge + dt,), orig)
+            dt = min(max(dt, lo), hi)
+            for i in ids:
+                o, c = orig[i], self.by_id(i)
+                if d["mode"] == "left":
+                    c["start"], c["inp"], c["dur"] = o["start"] + dt, o["inp"] + dt, o["dur"] - dt
+                else:
+                    c["dur"] = o["dur"] + dt
+        self.draw_timeline()
+
+    def on_tl_release(self, e):
+        d, self.tdrag = self.tdrag, None
+        if not d:
+            return
+        if d["mode"] == "scrub":
+            if self.resume:
+                self.resume = False
+                self.play()
+            return
+        if d.get("moved"):
+            keep = set(d["orig"])
+            for i in d["orig"]:
+                c = self.by_id(i)
+                self.clear_range(c["kind"], c["track"], c["start"], c["start"] + c["dur"], keep)
+            self.commit(d["before"])
+
+    def on_tl_right(self, e):
+        if e.y < RULER_H or not self.clips and e.x >= HEAD_W:
+            return
+        menu = tk.Menu(self.root, tearoff=0, bg=FIELD, fg=FG, activebackground=ACCENT,
+                       activeforeground="white", bd=0, font=UI_FONT)
+        r = self.row_at(e.y)
+        if e.x < HEAD_W:
+            if not r:
+                return
+            kind, i = r[0], r[1]
+            menu.add_command(label=f"Delete track {kind.upper()}{i + 1}",
+                             command=lambda: self.delete_track(kind, i),
+                             state="normal" if len(self.tracks(kind)) > 1 else "disabled")
+        else:
+            cl, _ = self.clip_at(e.x, e.y)
+            if not cl:
+                return
+            if cl["id"] not in self.sel:
+                self.select(self.linked(cl))
+            menu.add_command(label="Split at playhead   Ctrl+B", command=self.split)
+            menu.add_command(label="Delete   Del", command=self.delete_sel)
+            menu.add_command(label="Ripple delete   Shift+Del", command=lambda: self.delete_sel(True))
+            menu.add_separator()
+            menu.add_command(label="Unlink audio / video" if cl["link"] else "Link selected clips",
+                             command=self.toggle_link)
+        menu.tk_popup(e.x_root, e.y_root)
+
+    # ---------- render graph ----------
+    def graph(self, t0, t1, W, H, fps, video=True, audio=True):
+        """FFmpeg inputs + filter parts that render the timeline from t0 to t1 at W x H.
+        Returns (inputs, parts, video label, audio label, number of inputs)."""
+        inputs, parts, n = [], [], 0
+        length = t1 - t0
+        vout = aout = None
+
+        def spans(kind, i):
+            for c in sorted((c for c in self.clips if (c["kind"], c["track"]) == (kind, i)),
+                            key=lambda c: c["start"]):
+                s, e = max(c["start"], t0), min(c["start"] + c["dur"], t1)
+                if e - s >= 0.01:
+                    yield c, s, e
+
+        if video:
+            parts.append(f"color=c=black:s={W}x{H}:r={fps}:d={length:.3f},format=yuv420p[base]")
+            vout = "[base]"
+            for ti, tr in enumerate(self.vtracks):
+                if tr["hidden"]:
+                    continue
+                for c, s, e in spans("v", ti):
+                    if self.media[c["path"]]["image"]:
+                        inputs += ["-loop", "1", "-framerate", str(fps), "-t", f"{e - s:.3f}"]
+                    else:
+                        inputs += ["-ss", f"{c['inp'] + s - c['start']:.3f}", "-t", f"{e - s:.3f}"]
+                    inputs += ["-i", c["path"]]
+                    parts.append(f"[{n}:v]{self.video_chain(c, s, t0, W, H, fps)}[v{n}]")
+                    # position is in frame pixels (Y up, like DaVinci); scaled for small previews
+                    k = W / max(self.vw, 1)
+                    parts.append(f"{vout}[v{n}]overlay=(W-w)/2+{cp(c, 'pos_x') * k:.2f}:"
+                                 f"(H-h)/2-{cp(c, 'pos_y') * k:.2f}:eof_action=pass[o{n}]")
+                    vout = f"[o{n}]"
+                    n += 1
+        if audio:
+            labels = []
+            for ti, tr in enumerate(self.atracks):
+                if tr["muted"]:
+                    continue
+                for c, s, e in spans("a", ti):
+                    inputs += ["-ss", f"{c['inp'] + s - c['start']:.3f}", "-t", f"{e - s:.3f}",
+                               "-i", c["path"]]
+                    parts.append(f"[{n}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts="
+                                 f"stereo,{self.audio_chain(c, s)}apad,atrim=duration={e - s:.3f},"
+                                 f"adelay={int(round((s - t0) * 1000))}:all=1[a{n}]")
+                    labels.append(f"[a{n}]")
+                    n += 1
+            parts.append(f"anullsrc=r=48000:cl=stereo,atrim=duration={length:.3f}[asil]")
+            aout = "[asil]"
+            if labels:
+                parts.append(f"[asil]{''.join(labels)}amix=inputs={len(labels) + 1}:"
+                             f"duration=first:normalize=0[amix]")
+                aout = "[amix]"
+        return inputs, parts, vout, aout, n
+
+    def video_chain(self, c, s, t0, W, H, fps):
+        """Filters for one visual clip: crop, flip, fit * zoom, rotate, opacity, fades, timing.
+        The rgba path is only taken when a setting needs alpha, to keep playback fast."""
+        f = []
+        cl, cr, ct, cb = (cp(c, k) / 100 for k in ("crop_l", "crop_r", "crop_t", "crop_b"))
+        if cl or cr or ct or cb:
+            f.append(f"crop=w=iw*{max(1 - cl - cr, 0.02):.4f}:h=ih*{max(1 - ct - cb, 0.02):.4f}:"
+                     f"x=iw*{cl:.4f}:y=ih*{ct:.4f}")
+        if cp(c, "flip_h"):
+            f.append("hflip")
+        if cp(c, "flip_v"):
+            f.append("vflip")
+        z = cp(c, "zoom")
+        f.append(f"fps={fps},scale={max(2, round(W * z))}:{max(2, round(H * z))}:"
+                 f"force_original_aspect_ratio=decrease:force_divisible_by=2")
+        rot, op = math.radians(cp(c, "rotation")), cp(c, "opacity") / 100
+        fi, fo = cp(c, "fade_in"), cp(c, "fade_out")
+        if rot or op < 1 or fi or fo:
+            f.append("format=rgba")
+            if rot:
+                f.append(f"rotate=a={rot:.5f}:c=none:ow=rotw({rot:.5f}):oh=roth({rot:.5f})")
+            if op < 1:
+                f.append(f"colorchannelmixer=aa={op:.3f}")
+            if fi or fo:   # fades run on clip time (fade can't start before 0)
+                f.append(f"setpts=PTS-STARTPTS+{s - c['start']:.3f}/TB")
+            if fi:
+                f.append(f"fade=t=in:st=0:d={fi:.3f}:alpha=1")
+            if fo:
+                f.append(f"fade=t=out:st={c['dur'] - fo:.3f}:d={fo:.3f}:alpha=1")
+        else:
+            f.append("format=yuva420p")
+        f.append(f"setpts=PTS-STARTPTS+{s - t0:.3f}/TB")
+        return ",".join(f)
+
+    def audio_chain(self, c, s):
+        """Volume, pan and fades for one audio clip ('' or filters ending in a comma)."""
+        f = []
+        if cp(c, "volume"):
+            f.append(f"volume={cp(c, 'volume'):.2f}dB")
+        pan = cp(c, "pan")
+        if pan:
+            f.append(f"pan=stereo|c0={min(1.0, 1 - pan):.3f}*c0|c1={min(1.0, 1 + pan):.3f}*c1")
+        fi, fo = cp(c, "fade_in"), cp(c, "fade_out")
+        if fi or fo:   # on clip time, then back to 0 so adelay / amix line up as before
+            f.append(f"asetpts=PTS-STARTPTS+{s - c['start']:.3f}/TB")
+            if fi:
+                f.append(f"afade=t=in:st=0:d={fi:.3f}")
+            if fo:
+                f.append(f"afade=t=out:st={c['dur'] - fo:.3f}:d={fo:.3f}")
+            f.append("asetpts=PTS-STARTPTS")
+        return "".join(x + "," for x in f)
+
+    def fps_str(self, fps):
+        return f"{fps:.3f}".rstrip("0").rstrip(".")
+
+    def preview_size(self):
+        self.layout()
+        return max(2, self.dw // 2 * 2), max(2, self.dh // 2 * 2)
+
+    # ---------- still frames ----------
+    def schedule_frame(self, delay=60):
+        if not self.clips or self.player:
+            return
+        if self.after_id:
+            self.root.after_cancel(self.after_id)
+        self.after_id = self.root.after(delay, self.fetch_frame)
+
+    # ---------- live preview ----------
+    def visible_layers(self, t):
+        """Visual clips under time t, bottom track first: what graph() overlays there."""
+        return [c for ti, tr in enumerate(self.vtracks) if not tr["hidden"]
+                for c in self.clips if c["kind"] == "v" and c["track"] == ti
+                and c["start"] <= t < c["start"] + c["dur"]]
+
+    def src_key(self, c, t):
+        image = self.media[c["path"]]["image"]
+        return c["path"], 0.0 if image else round(c["inp"] + t - c["start"], 3)
+
+    def live_preview(self):
+        """Composites the preview frame in memory from cached source frames, following graph():
+        crop, flip, fit * zoom, rotate, opacity and fades, then overlay at the position. Takes a
+        few ms, so sliders update while they move. Returns False while a source frame loads."""
+        if not self.clips or self.player:
+            return False
+        t = min(self.cur, max(self.tl_end() - 0.05, 0.0))
+        W, H = self.preview_size()
+        layers = self.visible_layers(t)
+        missing = [c for c in layers if self.src_key(c, t) not in self.src_cache]
+        if missing:
+            self.live_wanted = True
+            self.fetch_sources(missing, t, W, H)
+            return False
+        self.live_wanted = False
+        out = Image.new("RGB", (W, H), "black")
+        k = W / max(self.vw, 1)
+        for c in layers:
+            im = self.src_cache[self.src_key(c, t)]
+            cl, cr, ct, cb = (cp(c, x) / 100 for x in ("crop_l", "crop_r", "crop_t", "crop_b"))
+            if cl or cr or ct or cb:
+                iw, ih = im.size
+                x0, y0 = round(iw * cl), round(ih * ct)
+                im = im.crop((x0, y0, max(x0 + 1, round(iw * (1 - cr))),
+                              max(y0 + 1, round(ih * (1 - cb)))))
+            if cp(c, "flip_h"):
+                im = im.transpose(Image.FLIP_LEFT_RIGHT)
+            if cp(c, "flip_v"):
+                im = im.transpose(Image.FLIP_TOP_BOTTOM)
+            z = cp(c, "zoom")
+            r = min(W * z / im.width, H * z / im.height)
+            im = im.resize((max(2, round(im.width * r) // 2 * 2),
+                            max(2, round(im.height * r) // 2 * 2)), Image.BILINEAR)
+            local = t - c["start"]
+            alpha = cp(c, "opacity") / 100
+            fi, fo = cp(c, "fade_in"), cp(c, "fade_out")
+            if fi and local < fi:
+                alpha *= local / fi
+            if fo and local > c["dur"] - fo:
+                alpha *= max(0.0, (c["dur"] - local) / fo)
+            rot, mask = cp(c, "rotation"), None
+            if rot or alpha < 1:
+                im = im.convert("RGBA")
+                if rot:   # FFmpeg's rotate turns clockwise for positive angles, PIL the other way
+                    im = im.rotate(-rot, resample=Image.BILINEAR, expand=True)
+                if alpha < 1:
+                    im.putalpha(im.getchannel("A").point(lambda v: int(v * alpha)))
+                mask = im
+            out.paste(im, (round((W - im.width) / 2 + cp(c, "pos_x") * k),
+                           round((H - im.height) / 2 - cp(c, "pos_y") * k)), mask)
+        self.req += 1   # an FFmpeg frame still on its way has the old settings; drop it
+        self.frame = out
+        self.redraw()
+        return True
+
+    def fetch_sources(self, clips, t, W, H):
+        """Decodes the untouched source frame of each clip at t (up to 2x the preview, so
+        zooming in stays sharp) in the background."""
+        todo = []
+        for c in clips:
+            key = self.src_key(c, t)
+            if key not in self.src_pending and key not in self.src_cache:
+                self.src_pending.add(key)
+                todo.append((key, self.media[c["path"]]["image"]))
+        if not todo:
+            return
+        bw, bh = W * 2, H * 2
+
+        def work():
+            for key, image in todo:
+                img = None
+                if image:
+                    try:
+                        with Image.open(key[0]) as im:
+                            img = im.convert("RGB")
+                            img.thumbnail((bw, bh))
+                    except OSError:
+                        pass
+                else:
+                    img = run_bmp(["ffmpeg", "-v", "error", "-ss", f"{key[1]:.3f}", "-i", key[0],
+                                   "-frames:v", "1", "-vf",
+                                   f"scale='min({bw},iw)':'min({bh},ih)':force_original_aspect_ratio="
+                                   f"decrease", "-f", "image2pipe", "-c:v", "bmp", "-"])
+                self.q.put(("src", key, img))
+        threading.Thread(target=work, daemon=True).start()
+
+    def prefetch_sources(self):
+        """Warms the cache for the clips under the playhead, so the first slider move is live."""
+        if self.clips and not self.player and self.sel:
+            t = min(self.cur, max(self.tl_end() - 0.05, 0.0))
+            W, H = self.preview_size()
+            self.fetch_sources(self.visible_layers(t), t, W, H)
+
+    def fetch_frame(self):
+        self.after_id = None
+        if not self.clips:
+            return
+        self.prefetch_sources()
+        self.req += 1
+        W, H = self.preview_size()
+        t = min(self.cur, max(self.tl_end() - 0.05, 0.0))
+        inputs, parts, vout, _, _ = self.graph(t, t + 0.2, W, H, self.fps_str(self.pfps),
+                                               audio=False)
+        parts.append(f"{vout}format=rgb24[pv]")
+        cmd = (["ffmpeg", "-v", "error"] + inputs +
+               ["-filter_complex", ";".join(parts), "-map", "[pv]", "-frames:v", "1",
+                "-f", "image2pipe", "-c:v", "bmp", "-"])
+        token = self.req
+        threading.Thread(target=lambda: self.q.put(("frame", token, run_bmp(cmd))),
+                         daemon=True).start()
+
+    def poll(self):
+        try:
+            while True:
+                msg = self.q.get_nowait()
+                kind = msg[0]
+                if kind == "frame":
+                    _, token, img = msg
+                    if token == self.req and img is not None and not self.player:
+                        self.frame = img
+                        self.redraw()
+                elif kind == "dropinfo":
+                    if msg[2]:
+                        self.remember_media(msg[1], msg[2])
+                    if self.drop:
+                        self.draw_timeline()
+                elif kind in ("thumbs", "peaks"):
+                    (self.thumbs if kind == "thumbs" else self.peaks)[msg[1]] = msg[2]
+                    self.draw_timeline()
+                elif kind == "src":
+                    _, key, img = msg
+                    self.src_pending.discard(key)
+                    if img is not None:
+                        self.src_cache[key] = img
+                        while len(self.src_cache) > 40:   # oldest first
+                            self.src_cache.pop(next(iter(self.src_cache)))
+                        if self.live_wanted:
+                            self.live_preview()
+                elif kind == "encoders":
+                    _, codecs, opus = msg
+                    if codecs:
+                        self.codecs, self.opus_enc = codecs, opus
+                    gpus = sorted({c[0].split("(")[1].rstrip(")") for c in codecs
+                                   if c[2] in HW_FAMILIES})
+                    if not self.export_proc:
+                        self.status.config(text="Ready" + (f"   ·   GPU encoding: {', '.join(gpus)}"
+                                                           if gpus else "") +
+                                           (f"   ·   {self.dnd_off}" if self.dnd_off else ""))
+                elif kind == "progress":
+                    self.prog["value"] = msg[1] * 100
+                    self.status.config(text=f"Exporting...  {msg[1]:.0%}")
+                elif kind == "done":
+                    self.finish_export(msg[1], msg[2])
+        except queue.Empty:
+            pass
+        self.root.after(40, self.poll)
+
+    # ---------- playback ----------
+    def toggle_play(self):
+        if self.player:
+            self.pause()
+        else:
+            self.play()
+
+    def play(self):
+        if not self.clips or self.player:
+            return
+        rs, re = self.render_range()
+        loop = self.loop.get()
+        end = re if loop else self.tl_end()
+        if loop and not (rs <= self.cur < re - 0.05):
+            self.cur = rs
+        if self.cur >= end - 0.05:
+            self.cur = 0.0
+        if end - self.cur < 0.05:
+            return
+        W, H = self.preview_size()
+        fps = min(self.pfps, PREVIEW_FPS_CAP)
+        inputs, parts, vout, _, _ = self.graph(self.cur, end, W, H, self.fps_str(fps), audio=False)
+        parts.append(f"{vout}format=rgb24[pv]")
+        vcmd = (["ffmpeg", "-v", "error"] + inputs +
+                ["-filter_complex", ";".join(parts), "-map", "[pv]",
+                 "-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
+        self.play_end = end
+        self.player = Player(vcmd, self.sound_cmd(self.cur, end), (W, H), float(self.fps_str(fps)),
+                             self.pvol.get())
+        self.play_from, self.shown, self.t0 = self.cur, 0, None
+        self.play_btn.config(text=ICON["pause"])
+        self.tick()
+
+    def sound_cmd(self, start, end):
+        """ffmpeg command that mixes the timeline's audio from start to end as WAV, or None."""
+        if self.mute.get() or not any(c["kind"] == "a" and not self.atracks[c["track"]]["muted"]
+                                      and c["start"] < end and c["start"] + c["dur"] > start
+                                      for c in self.clips):
+            return None
+        inputs, parts, _, aout, _ = self.graph(start, end, 2, 2, "30", video=False)
+        return (["ffmpeg", "-v", "error"] + inputs +
+                ["-filter_complex", ";".join(parts), "-map", aout, "-f", "wav", "-"])
+
+    def set_pvol(self, v):
+        self.pvol.set(round(min(max(v, 0), 100)))
+        self.draw_pvol()
+        self.on_pvol()
+
+    def draw_pvol(self):
+        c, v = self.vol_cv, self.pvol.get()
+        c.delete("all")
+        x = 7 + 50 * v / 100
+        c.create_line(7, 12, 57, 12, fill=BORDER, width=4, capstyle="round")
+        if v:
+            c.create_line(7, 12, x, 12, fill=ACCENT, width=4, capstyle="round")
+        c.create_oval(x - 6, 6, x + 6, 18, fill="white", outline=ACCENT, width=2)
+
+    def on_pvol(self):
+        """Volume slider: saved, and applied to the running sound once the slider rests."""
+        if self.vol_job:
+            self.root.after_cancel(self.vol_job)
+        self.vol_job = self.root.after(250, self.apply_pvol)
+
+    def apply_pvol(self):
+        self.vol_job = None
+        self.settings["preview_volume"] = round(self.pvol.get())
+        save_settings(self.settings)
+        if self.player:
+            # the new sound starts a little ahead, as ffplay needs a moment to open the device
+            t = min(self.cur + 0.12, self.play_end)
+            self.player.set_sound(self.sound_cmd(t, self.play_end), self.pvol.get())
+
+    def pause(self):
+        if self.tick_id:
+            self.root.after_cancel(self.tick_id)
+            self.tick_id = None
+        if self.player:
+            self.player.stop()
+            self.player = None
+            self.play_btn.config(text=ICON["play"])
+            self.redraw()
+
+    def restart_if_playing(self):
+        if self.player:
+            self.pause()
+            self.play()
+        else:
+            self.schedule_frame()
+
+    def tick(self):
+        self.tick_id = None
+        p = self.player
+        if not p:
+            return
+        latest, ended = None, False
+        due = 1 if self.t0 is None else int((time.perf_counter() - self.t0) * p.fps) + 1
+        while self.shown < due:
+            try:
+                d = p.frames.get_nowait()
+            except queue.Empty:
+                break
+            if d is None:
+                ended = True
+                break
+            latest = d
+            self.shown += 1
+            if self.t0 is None:
+                self.t0 = time.perf_counter()
+        if latest is not None:
+            self.frame = Image.frombuffer("RGB", (p.w, p.h), latest, "raw", "RGB", 0, 1)
+            self.cur = min(self.tl_end(), self.play_from + (self.shown - 1) / p.fps)
+            self.redraw()
+            self.follow_playhead()
+            self.update_time()
+        if ended:
+            self.pause()
+            if self.loop.get():
+                self.cur = self.render_range()[0]
+                self.play()
+            return
+        self.tick_id = self.root.after(5, self.tick)
+
+    def seek(self, t):
+        if not self.clips:
+            return
+        playing = self.player is not None
+        if playing:
+            self.pause()
+        self.cur = min(max(t, 0.0), self.tl_end())
+        self.update_time()
+        self.draw_playhead()
+        if playing:
+            self.play()
+        else:
+            self.schedule_frame()
+
+    def step(self, secs):
+        self.seek(self.cur + secs)
+        self.follow_playhead()
+
+    # ---------- files ----------
+    def open_video(self):
+        path = filedialog.askopenfilename(initialdir=self.last_dir, filetypes=MEDIA_TYPES)
+        if not path:
+            return
+        if self.clips and not messagebox.askyesno(
+                "q-edit", "Start a new timeline with this file?\n"
+                               "(Use Add media to add it to the current one.)"):
+            return
+        self.pause()
+        self.clips, self.sel = [], set()
+        self.vtracks, self.atracks = [{"hidden": False}], [{"muted": False}]
+        self.vw = self.vh = 0
+        self.cur, self.mark_in, self.mark_out = 0.0, None, None
+        self.add_media([path])
+        self.undo_stack.clear()
+        self.redo_stack.clear()
+
+    def load_media(self, path):
+        if path in self.media:
+            return self.media[path]
+        self.status.config(text=f"Loading {Path(path).name}...")
+        self.root.update_idletasks()
+        m = read_media(path)
+        if not m:
+            messagebox.showerror("Error", f"FFmpeg could not read {Path(path).name}.")
+            return None
+        self.remember_media(path, m)
+        return m
+
+    def remember_media(self, path, m):
+        """Caches a probe and reads the clip's thumbnails / waveform in the background."""
+        if path in self.media:
+            return
+        self.media[path] = m
+
+        def work():
+            if m["video"]:
+                self.q.put(("thumbs", path, extract_thumbs(path, m)))
+            if m["audio"]:
+                self.q.put(("peaks", path, extract_peaks(path)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def add_media(self, paths=None, drop=None):
+        """Puts media on the timeline. Without drop: appended at the end of V1/A1 (or the tracks of
+        the selected clip). drop = (time, track index): placed there one after another, over
+        whatever is in the way, like a drop in any editor; missing tracks are created."""
+        if paths is None:
+            paths = filedialog.askopenfilenames(initialdir=self.last_dir, filetypes=MEDIA_TYPES)
+        if not paths:
+            return
+        self.pause()
+        before = self.snapshot()
+        was_empty = not self.clips
+        chosen = [c for c in self.clips if c["id"] in self.sel]
+        vt = next((c["track"] for c in chosen if c["kind"] == "v"), 0)
+        at = next((c["track"] for c in chosen if c["kind"] == "a"), 0)
+        if drop:
+            vt = at = drop[1]
+            cursor = 0.0 if was_empty else max(drop[0], 0.0)
+        added = []
+        for path in paths:
+            m = self.load_media(path)
+            if not m:
+                continue
+            self.last_dir = str(Path(path).parent)
+            if not self.vw and m["video"]:
+                img = None if m["image"] else grab_frame(path, 0)
+                size = m["size"] if m["image"] else (img.size if img else None)
+                if not size:
+                    messagebox.showerror("Error", f"FFmpeg could not read {Path(path).name}.")
+                    continue
+                self.vw, self.vh = size
+                if not m["image"]:
+                    self.pfps = m["fps"]
+                self.crop = [0.0, 0.0, float(self.vw), float(self.vh)]
+                self.apply_ratio()
+
+            def end_of(kind, i):
+                return max((c["start"] + c["dur"] for c in self.clips
+                            if (c["kind"], c["track"]) == (kind, i)), default=0.0)
+            dur = IMAGE_DUR if m["image"] else m["dur"]
+            if drop:
+                start = cursor
+                cursor += dur
+            else:
+                start = max(end_of("v", vt) if m["video"] else 0.0,
+                            end_of("a", at) if m["audio"] else 0.0)
+            link = self.new_id() if m["video"] and m["audio"] else None
+            for kind, track, has in (("v", vt, m["video"]), ("a", at, m["audio"])):
+                if has:
+                    while len(self.tracks(kind)) <= track:
+                        self.tracks(kind).append({"hidden": False} if kind == "v" else {"muted": False})
+                    c = {"id": self.new_id(), "kind": kind, "track": track, "path": path,
+                         "start": start, "inp": 0.0, "dur": dur, "link": link}
+                    if drop:
+                        self.clear_range(kind, track, start, start + dur, set(added))
+                    self.clips.append(c)
+                    added.append(c["id"])
+        if not added:
+            self.status.config(text="Ready")
+            return
+        if not self.vw:
+            self.vw, self.vh = 1920, 1080
+            self.crop = [0.0, 0.0, 1920.0, 1080.0]
+            self.apply_ratio()
+        self.sel.clear()
+        if was_empty:
+            self.cur = 0.0
+        self.commit(before)
+        if was_empty:
+            self.zoom_fit()
+        self.status.config(text=f"{len(self.clips)} clips on timeline   ·   {self.vw}x{self.vh}   ·   "
+                                f"{self.pfps:.2f} fps   ·   {fmt_time(self.tl_end())}")
+        self.redraw()
+
+    # ---------- drag and drop from Explorer ----------
+    def setup_dnd(self):
+        # said in the status bar, since a missing package otherwise just looks like a broken drop
+        self.dnd_off = (f"drag & drop off: run  py -{sys.version_info[0]}.{sys.version_info[1]} -m pip install tkinterdnd2"
+                        if TkinterDnD is None else "drag & drop off: tkdnd failed to load")
+        if TkinterDnD is None:
+            return
+        try:
+            TkinterDnD._require(self.root)
+        except (tk.TclError, RuntimeError):
+            return
+        self.dnd_off = None
+        # every widget in the window takes drops (a plain tk.Tk root has no dnd methods);
+        # the mouse position, not the widget, decides what a drop does
+        todo = list(self.root.winfo_children())
+        while todo:
+            w = todo.pop()
+            todo += w.winfo_children()
+            if isinstance(w, tk.Menu) or not hasattr(w, "drop_target_register"):
+                continue
+            w.drop_target_register(DND_FILES)
+            for ev in ("<<DropEnter>>", "<<DropPosition>>"):
+                w.dnd_bind(ev, self.on_drop_move)
+            w.dnd_bind("<<DropLeave>>", self.on_drop_leave)
+            w.dnd_bind("<<Drop>>", self.on_drop)
+
+    def over_timeline(self, e):
+        w = self.root.winfo_containing(e.x_root, e.y_root)
+        return w is not None and str(w) == str(self.tl)
+
+    def drop_paths(self, data):
+        """Media files in a drop; folders give the media files inside them."""
+        out = []
+        for p in self.root.tk.splitlist(data or ""):
+            p = Path(p)
+            if p.is_dir():
+                out += sorted(str(f) for f in p.iterdir() if f.suffix.lower() in MEDIA_EXT)
+            elif p.suffix.lower() in MEDIA_EXT:
+                out.append(str(p))
+        return out
+
+    def drop_dur(self, path):
+        m = self.media.get(path)
+        if not m:
+            return 3.0   # still being read
+        return IMAGE_DUR if m["image"] else m["dur"]
+
+    def on_drop_move(self, e):
+        timeline = self.over_timeline(e)
+        if self.export_proc:
+            return "refuse_drop"
+        if not self.drop or (e.data and e.data != self.drop["key"]):
+            paths = self.drop_paths(e.data)
+            self.drop = {"key": e.data, "paths": paths, "target": None, "kind": "v"}
+            todo = [p for p in paths if p not in self.media]
+            if todo:   # read durations in the background so the ghost clips get their real length
+                threading.Thread(target=lambda: [self.q.put(("dropinfo", p, read_media(p)))
+                                                 for p in todo], daemon=True).start()
+        paths = self.drop["paths"]
+        # Windows often sends the file list only with the drop itself, so an empty list while
+        # dragging is normal; refusing it would block the drop. Refuse only non-media files.
+        if e.data and not paths:
+            return "refuse_drop"
+        n = (f"{len(paths)} files" if len(paths) > 1 else Path(paths[0]).name) if paths else "files"
+        if not timeline or not self.clips:
+            self.drop["target"] = None
+            self.status.config(text=f"Drop to add {n} to the end of the timeline")
+            self.draw_timeline()
+            return "copy"
+        x = e.x_root - self.tl.winfo_rootx()
+        y = e.y_root - self.tl.winfo_rooty()
+        rows = self.rows()
+        r = self.row_at(y) or (rows[0] if y < RULER_H else rows[-1])
+        t = max(0.0, self.x2t(max(x, HEAD_W)))
+        total = sum(self.drop_dur(p) for p in paths)
+        t = max(0.0, t + self.snap_delta((t, t + total), ()))
+        self.drop.update(target=(t, r[1]), kind=r[0])
+        self.status.config(text=f"Drop to place {n} at {fmt_time(t)} on V{r[1] + 1} / A{r[1] + 1}")
+        self.draw_timeline()
+        return "copy"
+
+    def on_drop_leave(self, e):
+        self.drop = None
+        self.status.config(text="Ready")
+        self.draw_timeline()
+
+    def on_drop(self, e):
+        timeline = self.over_timeline(e)
+        paths = self.drop_paths(e.data)
+        target = self.drop and self.drop.get("target") if timeline else None
+        self.drop = None
+        if not paths or self.export_proc:
+            self.draw_timeline()
+            return "refuse_drop"
+        # add after the drop returns, so Explorer isn't kept waiting while files are read
+        self.root.after(10, lambda: self.add_media(paths, drop=target))
+        return "copy"
+
+    # ---------- crop ----------
+    def get_ratio(self):
+        try:
+            size = parse_size(self.outsize.get())
+        except ValueError:
+            size = None
+        if size:
+            return size[0] / size[1]
+        return RATIOS[self.ratio.get()]
+
+    def on_outsize(self):
+        try:
+            if parse_size(self.outsize.get()):
+                self.apply_ratio()
+                return
+        except ValueError:
+            pass
+        self.redraw()
+
+    def output_dims(self):
+        try:
+            size = parse_size(self.outsize.get())
+        except ValueError:
+            size = None
+        if size:
+            return size
+        return max(2, int(self.crop[2]) // 2 * 2), max(2, int(self.crop[3]) // 2 * 2)
+
+    def apply_ratio(self):
+        if not self.vw:
+            return
+        r = self.get_ratio()
+        if r is None:
+            self.redraw()
+            return
+        if self.vw / self.vh > r:
+            h = self.vh
+            w = h * r
+        else:
+            w = self.vw
+            h = w / r
+        self.crop = [(self.vw - w) / 2, (self.vh - h) / 2, w, h]
+        self.redraw()
+
+    # ---------- transform on the preview ----------
+    def preview_target(self):
+        """The selected visual clip under the playhead (it gets the on-screen handles)."""
+        if self.player or not self.clips:
+            return None
+        t = min(self.cur, max(self.tl_end() - 0.05, 0.0))
+        sel = [c for c in self.visible_layers(t) if c["id"] in self.sel]
+        if not sel:
+            return None
+        return next((c for c in sel if c["id"] == self.insp_focus), sel[-1])
+
+    def clip_geom(self, c):
+        """(center x, center y, width, height, rotation) of a visual clip in frame pixels,
+        placed the way graph() places it."""
+        m = self.media.get(c["path"]) or {}
+        iw, ih = m.get("size") or (self.vw, self.vh)
+        iw *= max(1 - (cp(c, "crop_l") + cp(c, "crop_r")) / 100, 0.02)
+        ih *= max(1 - (cp(c, "crop_t") + cp(c, "crop_b")) / 100, 0.02)
+        z = cp(c, "zoom")
+        r = min(self.vw * z / iw, self.vh * z / ih)
+        return (self.vw / 2 + cp(c, "pos_x"), self.vh / 2 - cp(c, "pos_y"), iw * r, ih * r,
+                cp(c, "rotation"))
+
+    def clip_corners(self, c):
+        cx, cy, w, h, rot = self.clip_geom(c)
+        a = math.radians(rot)   # FFmpeg rotates clockwise on screen for positive angles
+        ca, sa = math.cos(a), math.sin(a)
+        return [self.to_cv(cx + x * ca - y * sa, cy + x * sa + y * ca)
+                for x, y in ((-w / 2, -h / 2), (w / 2, -h / 2), (w / 2, h / 2), (-w / 2, h / 2))]
+
+    def in_clip(self, c, ex, ey):
+        cx, cy, w, h, rot = self.clip_geom(c)
+        sx, sy = self.to_src(ex, ey)
+        a = -math.radians(rot)
+        dx, dy = sx - cx, sy - cy
+        x, y = dx * math.cos(a) - dy * math.sin(a), dx * math.sin(a) + dy * math.cos(a)
+        return abs(x) <= w / 2 and abs(y) <= h / 2
+
+    def hit(self, ex, ey):
+        """What a click on the preview grabs: the selected clip's corners (scale), the crop
+        corners, a clip's picture (move; the selected one first, then the topmost), or the
+        crop box's edge (move the crop)."""
+        tgt = self.preview_target()
+        if tgt:
+            for px, py in self.clip_corners(tgt):
+                if abs(ex - px) <= HANDLE + 3 and abs(ey - py) <= HANDLE + 3:
+                    return "scale", tgt
+        x, y, w, h = self.crop
+        for sx, sy, ax, ay in ((x, y, x + w, y + h), (x + w, y, x, y + h),
+                               (x, y + h, x + w, y), (x + w, y + h, x, y)):
+            px, py = self.to_cv(sx, sy)
+            if abs(ex - px) <= HANDLE + 3 and abs(ey - py) <= HANDLE + 3:
+                return "resize", (ax, ay)
+        if tgt and self.in_clip(tgt, ex, ey):
+            return "clip", tgt
+        if not self.player and self.clips:
+            t = min(self.cur, max(self.tl_end() - 0.05, 0.0))
+            for c in reversed(self.visible_layers(t)):
+                if self.in_clip(c, ex, ey):
+                    return "clip", c
+        x1, y1 = self.to_cv(x, y)
+        x2, y2 = self.to_cv(x + w, y + h)
+        if ((abs(ex - x1) <= 5 or abs(ex - x2) <= 5) and y1 - 5 <= ey <= y2 + 5) or \
+                ((abs(ey - y1) <= 5 or abs(ey - y2) <= 5) and x1 - 5 <= ex <= x2 + 5):
+            return "move", None
+        return None, None
+
+    def on_hover(self, e):
+        if not self.vw or self.drag:
+            return
+        kind, _ = self.hit(e.x, e.y)
+        self.cv.config(cursor={"resize": "crosshair", "move": "fleur", "clip": "fleur",
+                               "scale": "sizing"}.get(kind, ""))
+
+    def on_press(self, e):
+        self.root.focus_set()
+        if not self.vw:
+            return
+        kind, obj = self.hit(e.x, e.y)
+        sx, sy = self.to_src(e.x, e.y)
+        if kind in ("clip", "scale"):
+            c = obj
+            if c["id"] not in self.sel:
+                self.insp_commit()
+                self.sel = set(self.linked(c))
+            self.insp_focus, self.insp_kind = c["id"], "v"
+            self.draw_timeline()
+            movers = [x for x in self.clips if x["id"] in self.sel and x["kind"] == "v"]
+            cx, cy = self.clip_geom(c)[:2]
+            self.drag = {"mode": kind, "sx": sx, "sy": sy, "moved": False, "center": (cx, cy),
+                         "d0": max(math.hypot(sx - cx, sy - cy), 1.0), "before": self.snapshot(),
+                         "orig": {x["id"]: (cp(x, "pos_x"), cp(x, "pos_y"), cp(x, "zoom"))
+                                  for x in movers}}
+            self.prefetch_sources()
+            self.redraw()
+        elif kind:
+            self.drag = {"mode": kind, "anchor": obj, "sx": sx, "sy": sy, "crop": list(self.crop)}
+
+    def on_drag(self, e):
+        d = self.drag
+        if not d:
+            return
+        sx, sy = self.to_src(e.x, e.y)
+        dx, dy = sx - d["sx"], sy - d["sy"]
+        if d["mode"] in ("clip", "scale"):
+            if not d["moved"] and abs(dx) * self.s < 3 and abs(dy) * self.s < 3:
+                return
+            d["moved"] = True
+            free = e.state & 0x1   # Shift: no snapping
+            cx, cy = d["center"]
+            for i, (px, py, z) in d["orig"].items():
+                c = self.by_id(i)
+                if d["mode"] == "clip":
+                    nx, ny = px + dx, py - dy
+                    if not free:   # snaps to the center lines
+                        nx = 0.0 if abs(nx) < 8 / self.s else nx
+                        ny = 0.0 if abs(ny) < 8 / self.s else ny
+                    self.set_prop(c, "pos_x", round(nx))
+                    self.set_prop(c, "pos_y", round(ny))
+                else:
+                    nz = min(max(z * math.hypot(sx - cx, sy - cy) / d["d0"], 0.05), 8.0)
+                    if not free and abs(nz - 1.0) < 0.02:
+                        nz = 1.0
+                    self.set_prop(c, "zoom", round(nz, 3))
+            self.refresh_inspector()
+            self.queue_live()
+            return
+        if d["mode"] == "move":
+            oc = d["crop"]
+            self.crop[0] = min(max(oc[0] + dx, 0), self.vw - oc[2])
+            self.crop[1] = min(max(oc[1] + dy, 0), self.vh - oc[3])
+        elif d["mode"] == "resize":
+            self.resize_crop(d["anchor"], sx, sy)
+        self.redraw()
+
+    def on_release(self, e):
+        d, self.drag = self.drag, None
+        if d and d["mode"] in ("clip", "scale") and d["moved"]:
+            self.commit(d["before"])
+            self.refresh_inspector(force=True)
+        elif d:
+            self.redraw()
+
+    def resize_crop(self, anchor, sx, sy):
+        ax, ay = anchor
+        sx = min(max(sx, 0), self.vw)
+        sy = min(max(sy, 0), self.vh)
+        right, down = sx >= ax, sy >= ay
+        maxw = self.vw - ax if right else ax
+        maxh = self.vh - ay if down else ay
+        w, h = abs(sx - ax), abs(sy - ay)
+        r = self.get_ratio()
+        if r:
+            if w / r > h:
+                h = w / r
+            else:
+                w = h * r
+            w = max(w, MIN_CROP)
+            h = w / r
+            if w > maxw:
+                w, h = maxw, maxw / r
+            if h > maxh:
+                h, w = maxh, maxh * r
+        else:
+            w = min(max(w, MIN_CROP), maxw)
+            h = min(max(h, MIN_CROP), maxh)
+        self.crop = [ax if right else ax - w, ay if down else ay - h, w, h]
+
+    # ---------- in / out marks ----------
+    def set_start(self):
+        if not self.clips:
+            return
+        self.mark_in = self.cur
+        if self.mark_out is not None and self.mark_out <= self.cur:
+            self.mark_out = None
+        self.update_range()
+        self.draw_timeline()
+
+    def set_end(self):
+        if not self.clips:
+            return
+        self.mark_out = self.cur
+        if self.mark_in is not None and self.mark_in >= self.cur:
+            self.mark_in = None
+        self.update_range()
+        self.draw_timeline()
+
+    def clear_marks(self):
+        self.mark_in = self.mark_out = None
+        self.update_range()
+        self.draw_timeline()
+
+    # ---------- export ----------
+    def export(self):
+        if self.export_proc:
+            self.cancelled = True
+            try:
+                self.export_proc.kill()
+            except OSError:
+                pass
+            return
+        if not self.clips:
+            messagebox.showinfo("q-edit", "Open a video first.")
+            return
+        if self.render_len() < 0.1:
+            messagebox.showerror("q-edit", "The range to export is too short. "
+                                                "Check the in / out marks.")
+            return
+        try:
+            parse_size(self.outsize.get())
+        except ValueError:
+            messagebox.showerror("q-edit", "Output size must look like 1080x1920, or be blank.")
+            return
+        self.pause()
+        ExportDialog(self)
+
+    def build_cmd(self, out, settings, codec, kbps):
+        x, y, w, h = self.crop
+        cw, ch = max(2, int(w) // 2 * 2), max(2, int(h) // 2 * 2)
+        W, H = (self.vw + 1) // 2 * 2, (self.vh + 1) // 2 * 2
+        cx = max(0, min(int(round(x)), W - cw))
+        cy = max(0, min(int(round(y)), H - ch))
+        rs, re = self.render_range()
+        length = re - rs
+        container = settings["container"]
+        audio = AUDIO[settings["audio"]] if self.any_audio() else "none"
+        fps = settings["fps"] if settings["fps"] != "Source" else self.fps_str(self.pfps)
+
+        inputs, parts, vout, aout, _ = self.graph(rs, re, W, H, fps, audio=audio != "none")
+        cmd = ["ffmpeg", "-y", "-v", "error", "-nostats", "-progress", "pipe:1"] + inputs
+        fc = ";".join(parts) + f";{vout}crop={cw}:{ch}:{cx}:{cy}"
+        ow, oh = self.output_dims()
+        if (ow, oh) != (cw, ch):
+            fc += f",scale={ow}:{oh}"
+        fc += ",setsar=1[out]"
+
+        cmd += ["-filter_complex", fc, "-map", "[out]"]
+        if audio != "none":
+            cmd += ["-map", aout]
+        cmd += video_args(codec, settings["speed"], settings["mode"], settings["quality"],
+                          kbps, container)
+        cmd += audio_args(audio, settings["abr"], self.opus_enc)
+        if container in ("mp4", "mov"):
+            cmd += ["-movflags", "+faststart"]
+        cmd.append(out)
+        return cmd, length
+
+    def start_export(self, out, settings, codec, kbps):
+        cmd, length = self.build_cmd(out, settings, codec, kbps)
+        self.export_out = out
+        self.cancelled = False
+        self.prog["value"] = 0
+        self.export_btn.config(text="Cancel export")
+        self.status.config(text=f"Exporting with {codec[0]}...")
+        try:
+            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 stdin=subprocess.DEVNULL, text=True, creationflags=NOWIN)
+        except OSError as e:
+            self.finish_export(False, str(e))
+            return
+        self.export_proc = p
+        threading.Thread(target=self.run_export, args=(p, length), daemon=True).start()
+
+    def run_export(self, p, length):
+        err = []
+        threading.Thread(target=lambda: err.append(p.stderr.read()), daemon=True).start()
+        for line in p.stdout:
+            if line.startswith("out_time_us="):
+                try:
+                    self.q.put(("progress", min(1.0, int(line.split("=", 1)[1]) / 1e6 / length)))
+                except ValueError:
+                    pass
+        p.wait()
+        time.sleep(0.1)
+        self.q.put(("done", p.returncode == 0, ("".join(err)).strip()[-700:]))
+
+    def finish_export(self, ok, err):
+        self.export_proc = None
+        self.export_btn.config(text="Export")
+        if ok:
+            self.prog["value"] = 100
+            size = os.path.getsize(self.export_out) / 1048576
+            self.status.config(text=f"Done!  Saved {Path(self.export_out).name}  ({size:.1f} MB)")
+            self.last_export = self.export_out
+            self.tt_btn.pack(side="left", after=self.status)
+            if self.settings.get("tiktok_after"):
+                self.post_tiktok(self.export_out)
+        elif self.cancelled:
+            self.prog["value"] = 0
+            self.status.config(text="Export cancelled")
+            try:
+                os.remove(self.export_out)
+            except OSError:
+                pass
+        else:
+            self.prog["value"] = 0
+            self.status.config(text="Export failed")
+            messagebox.showerror("Export failed", err or "Unknown FFmpeg error")
+
+    # ---------- TikTok ----------
+    def post_tiktok(self, path=None):
+        if not path:
+            path = (self.last_export if self.last_export and os.path.exists(self.last_export)
+                    else filedialog.askopenfilename(
+                        title="Video to post", initialdir=self.last_dir or None,
+                        filetypes=[("Video", "*.mp4 *.mov *.webm *.mkv"), ("All files", "*.*")]))
+            if not path:
+                return
+        if self.tt_panel:
+            if self.tt_panel.path == path:
+                self.tt_panel.lift()
+                self.tt_panel.focus_force()
+                return
+            self.tt_panel.close()
+            if self.tt_panel:   # the user kept a running upload
+                return
+        self.pause()
+        self.tt_panel = TikTokPanel(self, path)
+
+    def on_close(self):
+        self.pause()
+        if self.tt_panel and self.tt_panel.job:
+            if not messagebox.askyesno("q-edit", "A TikTok upload is running. Quit anyway?"):
+                return
+        if self.export_proc:
+            if not messagebox.askyesno("q-edit", "An export is running. Quit anyway?"):
+                return
+            try:
+                self.export_proc.kill()
+            except OSError:
+                pass
+        self.root.destroy()
+
+
+def main():
+    if os.name == "nt":
+        try:
+            import ctypes
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            pass
+    # the installer puts its own FFmpeg in an "ffmpeg" folder next to the app; prefer it
+    bundled = APP_DIR / "ffmpeg"
+    if (bundled / "ffmpeg.exe").exists():
+        os.environ["PATH"] = str(bundled) + os.pathsep + os.environ.get("PATH", "")
+    migrate_settings_dir()
+    root = tk.Tk()
+    if not (shutil.which("ffmpeg") and shutil.which("ffprobe")):
+        root.withdraw()
+        messagebox.showerror("q-edit",
+                             "FFmpeg was not found.\nInstall it (winget install ffmpeg) "
+                             "and restart your terminal.")
+        return
+    App(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()

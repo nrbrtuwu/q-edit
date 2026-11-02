@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+
+# local settings and the encrypted TikTok login (never commit these)
+clip_editor_settings.json
+tiktok.dat
+
+# personal working notes
+CLAUDE.md
+
+# build tools and outputs (rebuilt by packaging/build.ps1)
+packaging/.venv/
+packaging/ffmpeg_dl/
+packaging/build/
+packaging/dist/
+packaging/Output/
+packaging/*.spec
