@@ -65,7 +65,7 @@ IMAGE_DUR = 5.0
 MIN_CLIP = 0.05
 MEDIA_TYPES = [("Media", "*.mp4 *.mov *.mkv *.avi *.webm *.m4v *.mp3 *.wav *.m4a *.aac *.flac "
                          "*.ogg *.png *.jpg *.jpeg *.bmp *.webp"), ("All files", "*.*")]
-APP_VERSION = "1.7.0"
+APP_VERSION = "1.7.1"
 FROZEN = getattr(sys, "frozen", False)  # True when running from the installed .exe
 APP_DIR = Path(sys.executable).parent if FROZEN else Path(__file__).parent
 DATA_DIR = Path(getattr(sys, "_MEIPASS", APP_DIR))
@@ -873,21 +873,40 @@ class TemplateSaveDialog(tk.Toplevel):
 
 
 class ProjectPicker(tk.Toplevel):
-    """New project: blank, or start from one of the saved templates."""
+    """The project window (also shown at startup): recent projects, Open, and a new project
+    that is blank or made from one of the saved templates."""
     TW, TH = 192, 108
 
     def __init__(self, app):
         super().__init__(app.root)
         self.app = app
-        self.title("New project")
+        self.title("Projects")
         self.configure(bg=BG)
         self.transient(app.root)
-        self.geometry("700x520")
+        self.geometry("830x640")
         self.minsize(520, 380)
         self.choice = None          # None = blank, else template folder
         self.tiles, self.photos = {}, []
         body = ttk.Frame(self, padding=(18, 16, 18, 14))
         body.pack(fill="both", expand=True)
+        recent = [p for p in app.settings.get("recent", []) if os.path.exists(p)][:5]
+        if recent:
+            ttk.Label(body, text="Recent projects", style="Head.TLabel").pack(anchor="w")
+            for path in recent:
+                row = tk.Label(body, text=f"{Path(path).stem}", bg=BG, fg=FG, cursor="hand2",
+                               font=("Segoe UI Semibold", 10), anchor="w")
+                row.pack(anchor="w", fill="x")
+                folder = str(Path(path).parent)
+                if len(folder) > 80:   # keep the start (drive) and the end (the project's folder)
+                    folder = folder[:30] + " … " + folder[-46:]
+                where = tk.Label(body, text=folder, bg=BG, fg=MUTED,
+                                 font=SMALL_FONT, anchor="w", cursor="hand2")
+                where.pack(anchor="w", fill="x", pady=(0, 4))
+                for w in (row, where):
+                    w.bind("<Button-1>", lambda e, p=path: self.open(p))
+                    w.bind("<Enter>", lambda e, r=row: r.config(fg=ACCENT))
+                    w.bind("<Leave>", lambda e, r=row: r.config(fg=FG))
+            ttk.Separator(body).pack(fill="x", pady=(6, 12))
         ttk.Label(body, text="Start a new project", style="Head.TLabel").pack(anchor="w")
         ttk.Label(body, text="Pick a template, or start blank. Save any project as a template "
                              "with File > Save as template.", style="Muted.TLabel",
@@ -897,6 +916,8 @@ class ProjectPicker(tk.Toplevel):
         self.del_btn = ttk.Button(btns, text="Delete template", command=self.delete,
                                   takefocus=False)
         self.del_btn.pack(side="left")
+        ttk.Button(btns, text="Open project…", command=lambda: self.open(None),
+                   takefocus=False).pack(side="left", padx=(8, 0))
         ttk.Button(btns, text="Create", style="Accent.TButton", command=self.create,
                    takefocus=False).pack(side="right")
         ttk.Button(btns, text="Cancel", command=self.destroy, takefocus=False).pack(side="right",
@@ -963,7 +984,8 @@ class ProjectPicker(tk.Toplevel):
         self.tiles[key] = f
 
     def layout(self):
-        cols = max(1, (self.cv.winfo_width() + 12) // (self.TW + 34))
+        tw = max((f.winfo_reqwidth() for f in self.tiles.values()), default=self.TW) + 12
+        cols = max(1, (self.cv.winfo_width() + 12) // tw)
         for n, f in enumerate(self.tiles.values()):
             f.grid(row=n // cols, column=n % cols, padx=(0, 12), pady=(0, 12), sticky="nw")
         self.grid.update_idletasks()
@@ -989,6 +1011,14 @@ class ProjectPicker(tk.Toplevel):
         choice = self.choice
         self.destroy()
         self.app.start_project(choice)
+
+    def open(self, path):
+        """A recent project, or (None) pick one / a video with the Open dialog."""
+        self.destroy()
+        if path:
+            self.app.open_project(path)
+        else:
+            self.app.open_any()
 
 
 # ---------------------------------------------------------------- inspector control
@@ -3814,7 +3844,8 @@ def main():
                              "FFmpeg was not found.\nInstall it (winget install ffmpeg) "
                              "and restart your terminal.")
         return
-    App(root)
+    app = App(root)
+    root.after(200, app.new_project)   # start with the project window
     root.mainloop()
 
 
