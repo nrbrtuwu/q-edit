@@ -3,8 +3,6 @@
 A small, fast desktop video editor for Windows: a multi-track timeline, a DaVinci-style inspector,
 and posting straight to TikTok.
 
-Website: https://nrbrtuwu.github.io/q-edit/
-
 ## Features
 
 - Timeline with any number of video and audio tracks: cut, split, trim, ripple delete, snapping,
@@ -40,8 +38,8 @@ q-edit talks to TikTok through TikTok's official Content Posting API. To use it,
 `http://127.0.0.1:*/callback/`) and the Content Posting API (Direct Post), then paste its client key
 and secret into q-edit (Post to TikTok > Keys). Until TikTok reviews the app, posts are private.
 
-- [Terms of Service](https://nrbrtuwu.github.io/q-edit/terms.html)
-- [Privacy Policy](https://nrbrtuwu.github.io/q-edit/privacy.html)
+- [Terms of Service](TERMS.md)
+- [Privacy Policy](PRIVACY.md)
 
 ## Third-party software
 
