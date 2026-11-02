@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-q-edit: a small dark-mode multi-track video editor (cut, splice, crop, export),
-with a Post to TikTok panel (caption, cover, on-video text) for finished exports.
+q-edit: a small dark-mode multi-track video editor (cut, splice, crop, export).
 
 Needs:  Python 3, FFmpeg on PATH (ffplay too, for preview sound), Pillow, tkinterdnd2 (optional,
         for dragging files in from Explorer)
@@ -18,7 +17,6 @@ Shortcuts:
   Del           delete selected clips   (Shift+Del: ripple delete, closes the gap)
   Ctrl+Z / Y    undo / redo
   Ctrl+wheel    zoom timeline   (wheel scrolls it)
-  Ctrl+T        post the last export to TikTok
 """
 
 import copy
@@ -31,7 +29,6 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import tkinter as tk
@@ -42,7 +39,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 try:
-    from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageTk
+    from PIL import Image, ImageTk
 except ImportError:
     print("Pillow is missing. Install it with:  pip install pillow")
     sys.exit(1)
@@ -52,8 +49,6 @@ try:   # drag and drop from Explorer (pip install tkinterdnd2); the app works wi
 except ImportError:
     TkinterDnD = None
 
-import tiktok_api
-from tiktok_api import TikTok, TikTokError
 
 NOWIN = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 RATIOS = {"Free": None, "16:9": 16 / 9, "9:16": 9 / 16, "1:1": 1.0, "4:5": 4 / 5, "4:3": 4 / 3}
@@ -67,7 +62,7 @@ IMAGE_DUR = 5.0
 MIN_CLIP = 0.05
 MEDIA_TYPES = [("Media", "*.mp4 *.mov *.mkv *.avi *.webm *.m4v *.mp3 *.wav *.m4a *.aac *.flac "
                          "*.ogg *.png *.jpg *.jpeg *.bmp *.webp"), ("All files", "*.*")]
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.6.0"
 FROZEN = getattr(sys, "frozen", False)  # True when running from the installed .exe
 APP_DIR = Path(sys.executable).parent if FROZEN else Path(__file__).parent
 DATA_DIR = Path(getattr(sys, "_MEIPASS", APP_DIR))
@@ -75,8 +70,6 @@ ICON_FILE = DATA_DIR / "clip_editor.ico"
 # the install folder is read-only, so the installed app keeps settings in %APPDATA%
 SETTINGS_FILE = (Path(os.environ.get("APPDATA", Path.home())) / "q-edit" / "settings.json"
                  if FROZEN else APP_DIR / "clip_editor_settings.json")
-TIKTOK_FILE = SETTINGS_FILE.parent / "tiktok.dat"   # keys + login, DPAPI-encrypted
-FONT_FILE = DATA_DIR / "fonts" / "TikTokSans36pt-Bold.ttf"
 
 
 def migrate_settings_dir():
@@ -90,7 +83,7 @@ def migrate_settings_dir():
 
 
 def load_settings():
-    """{"export": {...last export settings}, "tiktok_after": bool}"""
+    """{"export": {...last export settings}, "preview_volume": int}"""
     try:
         s = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -131,8 +124,7 @@ ICON = {k: chr(int(v, 16)) for k, v in dict(
     open="E8E5", add="E710", image="EB9F", video="E714", music="E8D6", cut="E8C6",
     delete="E74D", ripple="E750", undo="E7A7", redo="E7A6", zin="E8A3", zout="E71F", fit="E9A6",
     export="E898", vol="E767", mute="E74F", link="E71B", loop="E8EE", play="E768", pause="E769",
-    prev="E892", next="E893", cancel="E711", eye="E7B3", hide="ED1A",
-    send="E724").items()}
+    prev="E892", next="E893", cancel="E711", eye="E7B3", hide="ED1A").items()}
 ICON_FONT = "Segoe MDL2 Assets"  # replaced by Segoe Fluent Icons in apply_theme when installed
 
 
@@ -371,90 +363,6 @@ def parse_size(text):
     if w < 16 or h < 16:
         raise ValueError
     return w // 2 * 2, h // 2 * 2
-
-
-def media_info(path):
-    """Returns {"w", "h", "dur", "vcodec", "acodec"} of a finished video."""
-    r = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries",
-         "format=duration:stream=codec_type,codec_name,width,height", "-of", "json", path],
-        capture_output=True, text=True, creationflags=NOWIN)
-    info = {"w": 0, "h": 0, "dur": 0.0, "vcodec": None, "acodec": None}
-    try:
-        j = json.loads(r.stdout)
-        info["dur"] = float(j.get("format", {}).get("duration") or 0)
-    except ValueError:
-        return info
-    for s in j.get("streams", []):
-        if s.get("codec_type") == "video" and not info["vcodec"]:
-            info.update(w=int(s.get("width") or 0), h=int(s.get("height") or 0),
-                        vcodec=s.get("codec_name"))
-        elif s.get("codec_type") == "audio" and not info["acodec"]:
-            info["acodec"] = s.get("codec_name")
-    return info
-
-
-# ---------------------------------------------------------------- on-video text
-TEXT_STYLES = ["Outline", "Box", "Soft box", "Plain"]
-TEXT_COLORS = {"White": "#ffffff", "Black": "#121212", "Yellow": "#ffd23f", "Red": "#fe2c55",
-               "Cyan": "#25f4ee", "Green": "#3ddc84", "Orange": "#ff8a00", "Pink": "#ff6fb5"}
-_fonts = {}
-
-
-def text_font(px):
-    if px not in _fonts:
-        for f in (FONT_FILE, "segoeuib.ttf", "arialbd.ttf"):
-            try:
-                _fonts[px] = ImageFont.truetype(str(f), px)
-                break
-            except OSError:
-                continue
-        else:
-            _fonts[px] = ImageFont.load_default()
-    return _fonts[px]
-
-
-def render_text(item, frame_w):
-    """TikTok-style text block as an RGBA image sized for a frame frame_w pixels wide.
-    item: {"text", "style", "color", "size" (% of frame width)}."""
-    px = max(8, int(frame_w * item["size"] / 100))
-    font = text_font(px)
-    lines = item["text"].split("\n")
-    rgb = Image.new("RGB", (1, 1), TEXT_COLORS.get(item["color"], "#ffffff")).getpixel((0, 0))
-    light = (0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]) > 150
-    style = item["style"]
-    stroke = max(2, px // 11) if style == "Outline" else 0
-    boxed = style in ("Box", "Soft box")
-    padx, pady = (int(px * 0.32), int(px * 0.12)) if boxed else (0, 0)
-    asc, desc = font.getmetrics()
-    lh = asc + desc + 2 * pady
-    widths = [font.getlength(l) for l in lines]
-    m = stroke + px // 6   # room for outline and shadow
-    W = int(max(widths) + 2 * padx) + 2 * m
-    H = lh * len(lines) + 2 * m
-    img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    if style == "Plain":   # soft drop shadow
-        sh = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-        d = ImageDraw.Draw(sh)
-        for i, line in enumerate(lines):
-            d.text(((W - widths[i]) / 2, m + i * lh + px // 20), line, font=font,
-                   fill=(0, 0, 0, 170))
-        img = Image.alpha_composite(img, sh.filter(ImageFilter.GaussianBlur(px / 14)))
-    d = ImageDraw.Draw(img)
-    for i, line in enumerate(lines):
-        x, y = (W - widths[i]) / 2, m + i * lh
-        if boxed and line.strip():
-            fill = rgb + (255,) if style == "Box" else (0, 0, 0, 150)
-            d.rounded_rectangle((x - padx, y, x + widths[i] + padx, y + lh),
-                                radius=int(px * 0.28), fill=fill)
-        if style == "Box":
-            fg = (18, 18, 18) if light else (255, 255, 255)
-        else:
-            fg = rgb
-        dark = (0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]) < 50
-        outline = (255, 255, 255) if dark else (0, 0, 0)
-        d.text((x, y + pady), line, font=font, fill=fg, stroke_width=stroke, stroke_fill=outline)
-    return img
 
 
 # ---------------------------------------------------------------- encoders
@@ -716,11 +624,6 @@ class ExportDialog(tk.Toplevel):
         self.abr_cb = combo(self.v["abr"], AUDIO_BR)
         row("Bitrate", self.abr_cb, ttk.Label(body, text="kbps", style="Muted.TLabel"))
 
-        self.tiktok_after = tk.BooleanVar(value=app.settings.get("tiktok_after", False))
-        ttk.Checkbutton(body, text="Open Post to TikTok after export", variable=self.tiktok_after,
-                        takefocus=False).grid(row=r, column=0, columnspan=3, sticky="w", pady=(12, 0))
-        r += 1
-
         ttk.Separator(body).grid(row=r, column=0, columnspan=3, sticky="ew", pady=(14, 8))
         r += 1
         self.summary = ttk.Label(body, style="Muted.TLabel", justify="left")
@@ -865,893 +768,11 @@ class ExportDialog(tk.Toplevel):
         if not out:
             return
         self.app.exp_settings = settings
-        self.app.settings.update(export=settings, tiktok_after=self.tiktok_after.get())
+        self.app.settings["export"] = settings
+        self.app.settings.pop("tiktok_after", None)
         save_settings(self.app.settings)
         self.destroy()
         self.app.start_export(out, settings, codec, kbps)
-
-
-# ---------------------------------------------------------------- TikTok
-PRIVACY_NAMES = {"PUBLIC_TO_EVERYONE": "Everyone", "MUTUAL_FOLLOW_FRIENDS": "Friends",
-                 "FOLLOWER_OF_CREATOR": "Followers", "SELF_ONLY": "Only me"}
-TIKTOK_CODECS = {"h264", "hevc", "vp8", "vp9"}
-# left, top, right, bottom share of the frame that TikTok's buttons and caption cover on a phone
-SAFE_ZONE = (0.06, 0.08, 0.14, 0.22)
-CAPTION_MAX = 2200
-
-
-def popup_center(win, parent):
-    win.update_idletasks()
-    x = parent.winfo_rootx() + (parent.winfo_width() - win.winfo_width()) // 2
-    y = parent.winfo_rooty() + (parent.winfo_height() - win.winfo_height()) // 3
-    win.geometry(f"+{max(x, 0)}+{max(y, 0)}")
-
-
-def link_label(parent, text, url, bg=BG):
-    lbl = tk.Label(parent, text=text, fg=ACCENT, bg=bg, cursor="hand2",
-                   font=(SMALL_FONT[0], SMALL_FONT[1], "underline"))
-    lbl.bind("<Button-1>", lambda e: tiktok_api.open_url(url))
-    return lbl
-
-
-def parse_secs(text):
-    """'12.5' or '0:12.5' -> seconds, None if invalid."""
-    try:
-        m, _, s = text.strip().rpartition(":")
-        return (int(m) * 60 if m else 0) + float(s.replace(",", "."))
-    except ValueError:
-        return None
-
-
-class KeysDialog(tk.Toplevel):
-    """Client key and secret of the user's own TikTok developer app."""
-
-    def __init__(self, parent, tt, on_save):
-        super().__init__(parent)
-        self.tt, self.on_save = tt, on_save
-        self.title("TikTok developer keys")
-        self.configure(bg=BG)
-        self.resizable(False, False)
-        self.transient(parent)
-        body = ttk.Frame(self, padding=18)
-        body.pack(fill="both")
-        ttk.Label(body, text="Link q-edit to your TikTok developer app",
-                  style="Head.TLabel").pack(anchor="w")
-        steps = ("1.  Sign in at developers.tiktok.com and create an app.\n"
-                 "2.  Add Login Kit, platform Desktop, with this redirect URI:\n"
-                 f"        {tiktok_api.REDIRECT_HELP}\n"
-                 "3.  Add Content Posting API and turn on Direct Post.\n"
-                 "4.  Paste the app's Client key and Client secret below.\n\n"
-                 "Until TikTok reviews your app, posts are private (Only me) and the\n"
-                 "account has to be set to private while posting.")
-        ttk.Label(body, text=steps, justify="left").pack(anchor="w", pady=(6, 8))
-        link_label(body, "Open the TikTok developer portal", tiktok_api.PORTAL).pack(
-            anchor="w", pady=(0, 10))
-        form = ttk.Frame(body)
-        form.pack(fill="x")
-        self.key = tk.StringVar(value=tt.data.get("client_key", ""))
-        self.secret = tk.StringVar(value=tt.data.get("client_secret", ""))
-        for i, (label, var, show) in enumerate((("Client key", self.key, ""),
-                                                ("Client secret", self.secret, "•"))):
-            ttk.Label(form, text=label).grid(row=i, column=0, sticky="w", padx=(0, 12), pady=4)
-            ttk.Entry(form, textvariable=var, width=46, show=show).grid(row=i, column=1, pady=4)
-        btns = ttk.Frame(body)
-        btns.pack(anchor="e", pady=(14, 0))
-        ttk.Button(btns, text="Cancel", command=self.destroy, takefocus=False).pack(side="left")
-        ttk.Button(btns, text="Save", style="Accent.TButton", command=self.save,
-                   takefocus=False).pack(side="left", padx=(8, 0))
-        self.bind("<Escape>", lambda e: self.destroy())
-        self.bind("<Return>", lambda e: self.save())
-        dark_titlebar(self)
-        popup_center(self, parent)
-        self.grab_set()
-
-    def save(self):
-        key, secret = self.key.get().strip(), self.secret.get().strip()
-        if not (key and secret):
-            messagebox.showerror("TikTok", "Paste both the Client key and the Client secret.",
-                                 parent=self)
-            return
-        self.tt.set_keys(key, secret)
-        self.destroy()
-        self.on_save()
-
-
-class TikTokPanel(tk.Toplevel):
-    """Posts a finished video to the linked TikTok account with a caption, a cover and on-video
-    text. Text and an own cover image are burned in with one extra encode right before upload."""
-
-    def __init__(self, app, path):
-        super().__init__(app.root)
-        self.app, self.path, self.tt = app, path, app.tiktok
-        self.title(f"Post to TikTok  ·  {Path(path).name}")
-        self.configure(bg=BG)
-        self.geometry("1120x840")
-        self.minsize(980, 780)
-        self.q = queue.Queue()
-        self.info = media_info(path)
-        self.vw, self.vh = self.info["w"] or 1080, self.info["h"] or 1920
-        self.dur = max(self.info["dur"], 0.1)
-        # caption, text and cover survive closing the panel (until the app quits)
-        self.state = app.tt_state
-        self.texts = self.state.setdefault("texts", [])
-        for it in self.texts:
-            it["end"] = min(it["end"], self.dur)
-            it["start"] = min(it["start"], it["end"])
-        self.sel = None
-        self.t = 0.0
-        self.cover_t = min(self.state.get("cover_t", 0.0), self.dur)
-        self.cover_pil = None
-        self.frame = self.frame_photo = self.frame_key = None
-        self.frame_req, self.frame_job = 0, None
-        self.photos = {}
-        self.hitboxes = []
-        self.geo = (1.0, 1, 1, 0, 0)
-        self.drag = None
-        self.creator = None
-        self.job = None          # threading.Event of the running login / post (set = cancel)
-        self.loading = False
-        self.closed = False
-
-        self.build()
-        self.caption.insert("1.0", self.state.get("caption", ""))
-        self.update_count()
-        if self.state.get("cover_img"):
-            self.set_cover_image(self.state["cover_img"])
-        self.cover_mode.set(self.state.get("cover_mode", "frame"))
-        self.select_text(None)
-        self.refresh_account()
-        self.protocol("WM_DELETE_WINDOW", self.close)
-        dark_titlebar(self)
-        self.after(40, self.poll)
-        self.after(100, self.fetch_frame)
-
-    # ---------- layout ----------
-    def build(self):
-        right = ttk.Frame(self, padding=(8, 10, 14, 12), width=380)
-        right.pack(side="right", fill="y")
-        right.pack_propagate(False)
-        left = ttk.Frame(self, padding=(12, 10, 6, 12))
-        left.pack(side="left", fill="both", expand=True)
-
-        # preview + scrubber
-        self.cv = tk.Canvas(left, bg=CANVAS_BG, highlightthickness=0)
-        self.cv.pack(fill="both", expand=True)
-        self.cv.bind("<Configure>", lambda e: (self.redraw(), self.schedule_frame(250)))
-        self.cv.bind("<ButtonPress-1>", self.on_press)
-        self.cv.bind("<B1-Motion>", self.on_drag)
-        self.cv.bind("<ButtonRelease-1>", self.on_release)
-        sr = ttk.Frame(left)
-        sr.pack(fill="x", pady=(6, 0))
-        self.time_var = tk.DoubleVar(value=0.0)
-        ttk.Scale(sr, from_=0, to=self.dur, variable=self.time_var, takefocus=False,
-                  command=lambda v: self.on_scrub()).pack(side="left", fill="x", expand=True)
-        self.time_lbl = ttk.Label(sr, style="Muted.TLabel", width=17, anchor="e")
-        self.time_lbl.pack(side="left", padx=(8, 8))
-        self.safe = tk.BooleanVar(value=True)
-        cb = ttk.Checkbutton(sr, text="Safe zone", variable=self.safe, command=self.redraw,
-                             takefocus=False)
-        cb.pack(side="left")
-        Tip(cb, "Dashed box: the part of the video that TikTok's buttons and caption don't cover")
-
-        # on-video text editor
-        ttk.Label(left, text="On-video text", style="Head.TLabel").pack(anchor="w", pady=(10, 4))
-        ed = ttk.Frame(left)
-        ed.pack(fill="x")
-        ed.columnconfigure(8, weight=1)
-        self.app.btn(ed, ICON["add"] + "  Add text", self.add_text,
-                     style="ToolText.TButton").grid(row=0, column=0, sticky="w")
-        self.del_btn = self.app.btn(ed, ICON["delete"], self.remove_text, style="Tool.TButton",
-                                    tip="Remove this text")
-        self.del_btn.grid(row=0, column=1, padx=(2, 12))
-        self.style_var = tk.StringVar(value="Outline")
-        self.color_var = tk.StringVar(value="White")
-        self.size_var = tk.DoubleVar(value=7.0)
-        ttk.Label(ed, text="Style").grid(row=0, column=2, padx=(0, 4))
-        self.style_cb = ttk.Combobox(ed, textvariable=self.style_var, values=TEXT_STYLES,
-                                     state="readonly", width=9, takefocus=False)
-        self.style_cb.grid(row=0, column=3)
-        ttk.Label(ed, text="Color").grid(row=0, column=4, padx=(10, 4))
-        self.color_cb = ttk.Combobox(ed, textvariable=self.color_var, values=list(TEXT_COLORS),
-                                     state="readonly", width=8, takefocus=False)
-        self.color_cb.grid(row=0, column=5)
-        ttk.Label(ed, text="Size").grid(row=0, column=6, padx=(10, 4))
-        self.size_sc = ttk.Scale(ed, from_=3, to=16, variable=self.size_var, length=100,
-                                 takefocus=False)
-        self.size_sc.grid(row=0, column=7, sticky="w")
-
-        self.text_box = tk.Text(ed, height=2, bg=FIELD, fg=FG, insertbackground=FG, relief="flat",
-                                font=UI_FONT, wrap="word", padx=6, pady=4, undo=True,
-                                highlightthickness=1, highlightbackground=BORDER,
-                                highlightcolor=ACCENT)
-        self.text_box.grid(row=1, column=0, columnspan=9, sticky="ew", pady=6)
-        self.text_box.bind("<KeyRelease>", lambda e: self.edit_changed())
-
-        tr = ttk.Frame(ed)
-        tr.grid(row=2, column=0, columnspan=9, sticky="w")
-        self.from_var, self.to_var = tk.StringVar(), tk.StringVar()
-        ttk.Label(tr, text="Show from").pack(side="left")
-        self.from_e = ttk.Entry(tr, textvariable=self.from_var, width=8)
-        self.from_e.pack(side="left", padx=(6, 2))
-        self.from_btn = self.app.btn(tr, "◂ playhead", lambda: self.set_time("start"),
-                                     style="ToolText.TButton", tip="Start at the slider position")
-        self.from_btn.pack(side="left")
-        ttk.Label(tr, text="to").pack(side="left", padx=(10, 0))
-        self.to_e = ttk.Entry(tr, textvariable=self.to_var, width=8)
-        self.to_e.pack(side="left", padx=(6, 2))
-        self.to_btn = self.app.btn(tr, "◂ playhead", lambda: self.set_time("end"),
-                                   style="ToolText.TButton", tip="End at the slider position")
-        self.to_btn.pack(side="left")
-        self.all_btn = self.app.btn(tr, "Whole video", lambda: self.set_time("all"),
-                                    style="ToolText.TButton")
-        self.all_btn.pack(side="left", padx=(10, 0))
-        ttk.Label(left, text="Click text on the preview to select it, drag to move it. "
-                             "Seconds can be typed as 12.5 or 0:12.5.",
-                  style="Muted.TLabel", font=SMALL_FONT).pack(anchor="w", pady=(4, 0))
-        self.editor = [self.del_btn, self.style_cb, self.color_cb, self.size_sc, self.from_e,
-                       self.to_e, self.from_btn, self.to_btn, self.all_btn]
-        for var in (self.style_var, self.color_var, self.size_var, self.from_var, self.to_var):
-            var.trace_add("write", lambda *a: self.edit_changed())
-
-        # right column: account, caption, cover, privacy, disclosure, post
-        def head(text, top=10):
-            ttk.Label(right, text=text, style="Head.TLabel").pack(anchor="w", pady=(top, 4))
-
-        # bottom first, so the Post button always keeps its space
-        bottom = ttk.Frame(right)
-        bottom.pack(side="bottom", fill="x")
-        self.consent = ttk.Frame(bottom)
-        self.consent.pack(fill="x", pady=(0, 6))
-        pr = ttk.Frame(bottom)
-        pr.pack(fill="x")
-        self.post_btn = ttk.Button(pr, text="Post", style="Accent.TButton", command=self.post,
-                                   takefocus=False)
-        self.post_btn.pack(side="right")
-        self.prog = ttk.Progressbar(pr, maximum=100)
-        self.prog.pack(side="left", fill="x", expand=True, padx=(0, 10))
-        self.status = ttk.Label(bottom, text="", style="Muted.TLabel", font=SMALL_FONT,
-                                wraplength=350, justify="left")
-        self.status.pack(anchor="w", pady=(6, 0))
-        self.hint = ttk.Label(bottom, text="", foreground="#ffb454", font=SMALL_FONT,
-                              wraplength=350, justify="left")
-        self.hint.pack(anchor="w", pady=(0, 4), before=self.consent)
-        self.consent_key = None
-
-        head("Account", 0)
-        acct = ttk.Frame(right)
-        acct.pack(fill="x")
-        self.keys_btn = self.app.btn(acct, "Keys", self.edit_keys, style="ToolText.TButton",
-                                     tip="TikTok developer app keys")
-        self.keys_btn.pack(side="right", padx=(4, 0))
-        self.connect_btn = ttk.Button(acct, text="Connect", command=self.connect, takefocus=False)
-        self.connect_btn.pack(side="right")
-        names = ttk.Frame(acct)
-        names.pack(side="left", fill="x", expand=True)
-        self.acct_lbl = ttk.Label(names, text="", font=("Segoe UI Semibold", 11))
-        self.acct_lbl.pack(anchor="w")
-        self.acct_sub = ttk.Label(names, text="", style="Muted.TLabel", font=SMALL_FONT,
-                                  wraplength=200, justify="left")
-        self.acct_sub.pack(anchor="w")
-
-        ch = ttk.Frame(right)
-        ch.pack(fill="x", pady=(10, 4))
-        ttk.Label(ch, text="Caption", style="Head.TLabel").pack(side="left")
-        self.count_lbl = ttk.Label(ch, style="Muted.TLabel", font=SMALL_FONT)
-        self.count_lbl.pack(side="right")
-        self.caption = tk.Text(right, height=4, bg=FIELD, fg=FG, insertbackground=FG,
-                               relief="flat", font=UI_FONT, wrap="word", padx=6, pady=4, undo=True,
-                               highlightthickness=1, highlightbackground=BORDER,
-                               highlightcolor=ACCENT)
-        self.caption.pack(fill="x")
-        self.caption.bind("<KeyRelease>", lambda e: self.update_count())
-
-        head("Cover")
-        self.cover_mode = tk.StringVar(value="frame")
-        self.cover_mode.trace_add("write", lambda *a: (self.redraw(), self.update_post()))
-        cf = ttk.Frame(right)
-        cf.pack(fill="x")
-        cf.columnconfigure(1, weight=1)
-        self.cover_frame_rb = ttk.Radiobutton(cf, text="", value="frame", variable=self.cover_mode,
-                                              takefocus=False)
-        self.cover_frame_rb.grid(row=0, column=0, columnspan=2, sticky="w")
-        self.app.btn(cf, "Use slider frame", self.use_frame, style="ToolText.TButton",
-                     tip="Make the frame at the slider the cover").grid(row=0, column=2, sticky="e")
-        ttk.Radiobutton(cf, text="Own image", value="image", variable=self.cover_mode,
-                        takefocus=False).grid(row=1, column=0, sticky="w", pady=(4, 0))
-        self.cover_name = ttk.Label(cf, text="", style="Muted.TLabel", font=SMALL_FONT)
-        self.cover_name.grid(row=1, column=1, sticky="w", padx=6, pady=(4, 0))
-        self.app.btn(cf, "Choose…", self.choose_cover, style="ToolText.TButton",
-                     tip="It becomes the first frame of the video").grid(row=1, column=2, sticky="e",
-                                                                         pady=(4, 0))
-        self.update_cover_label()
-
-        head("Who can view this video")
-        self.privacy = tk.StringVar()
-        self.privacy_cb = ttk.Combobox(right, textvariable=self.privacy, state="readonly",
-                                       takefocus=False)
-        self.privacy_cb.pack(fill="x")
-        self.privacy.trace_add("write", lambda *a: self.update_post())
-
-        al = ttk.Frame(right)
-        al.pack(fill="x", pady=(6, 0))
-        ttk.Label(al, text="Allow", style="Muted.TLabel").pack(side="left", padx=(0, 10))
-        self.allow = {}
-        for key, label in (("comment", "Comment"), ("duet", "Duet"), ("stitch", "Stitch")):
-            v = tk.BooleanVar(value=False)
-            cb = ttk.Checkbutton(al, text=label, variable=v, takefocus=False)
-            cb.pack(side="left", padx=(0, 14))
-            self.allow[key] = (v, cb)
-
-        self.disclose = tk.BooleanVar(value=False)
-        self.brand_own = tk.BooleanVar(value=False)
-        self.brand_paid = tk.BooleanVar(value=False)
-        self.aigc = tk.BooleanVar(value=False)
-        ttk.Checkbutton(right, text="AI-generated content", variable=self.aigc,
-                        takefocus=False).pack(anchor="w", pady=(12, 0))
-        ttk.Checkbutton(right, text="Promotes a brand, product or service",
-                        variable=self.disclose, takefocus=False).pack(anchor="w", pady=(4, 0))
-        self.disc_box = ttk.Frame(right)
-        self.disc_box.pack(fill="x")
-        self.disc_inner = ttk.Frame(self.disc_box, padding=(22, 2, 0, 0))
-        ttk.Checkbutton(self.disc_inner, text="Your brand  (you're promoting yourself)",
-                        variable=self.brand_own, takefocus=False).pack(anchor="w")
-        ttk.Checkbutton(self.disc_inner, text="Branded content  (a paid partnership)",
-                        variable=self.brand_paid, takefocus=False).pack(anchor="w")
-        self.disc_lbl = ttk.Label(self.disc_inner, style="Muted.TLabel", font=SMALL_FONT,
-                                  wraplength=320, justify="left")
-        self.disc_lbl.pack(anchor="w")
-        for v in (self.disclose, self.brand_own, self.brand_paid):
-            v.trace_add("write", lambda *a: self.update_post())
-
-
-    # ---------- account ----------
-    def edit_keys(self):
-        KeysDialog(self, self.tt, self.refresh_account)
-
-    def refresh_account(self):
-        self.creator = None
-        if not self.tt.has_keys:
-            self.acct_lbl.config(text="Not set up")
-            self.acct_sub.config(text="Add the keys of your TikTok developer app to link an account.")
-            self.connect_btn.config(text="Set up…")
-        elif not self.tt.connected:
-            self.acct_lbl.config(text="Not connected")
-            self.acct_sub.config(text="Log in with the TikTok account you want to post to.")
-            self.connect_btn.config(text="Connect")
-        else:
-            self.acct_lbl.config(text="Loading…")
-            self.acct_sub.config(text="")
-            self.connect_btn.config(text="Disconnect")
-            threading.Thread(target=self.load_creator, daemon=True).start()
-        self.update_post()
-
-    def load_creator(self):
-        try:
-            self.q.put(("creator", self.tt.creator_info()))
-        except TikTokError as e:
-            self.q.put(("creator_err", e.code, str(e)))
-
-    def show_creator(self, info):
-        self.creator = info
-        self.acct_lbl.config(text=info.get("creator_nickname") or "TikTok account")
-        user = info.get("creator_username")
-        self.acct_sub.config(text=f"@{user}" if user else "")
-        for key, field in (("comment", "comment_disabled"), ("duet", "duet_disabled"),
-                           ("stitch", "stitch_disabled")):
-            v, cb = self.allow[key]
-            if info.get(field):
-                v.set(False)
-                cb.state(["disabled"])
-            else:
-                cb.state(["!disabled"])
-        self.update_post()
-
-    def connect(self):
-        if self.job and self.connect_btn.cget("text") == "Cancel login":
-            self.job.set()
-            return
-        if self.job:
-            return
-        if not self.tt.has_keys:
-            self.edit_keys()
-        elif self.tt.connected:
-            if messagebox.askyesno("TikTok", "Disconnect this TikTok account from q-edit?",
-                                   parent=self):
-                self.tt.disconnect()
-                self.refresh_account()
-        else:
-            self.job = threading.Event()
-            job = self.job
-            self.connect_btn.config(text="Cancel login")
-            self.status.config(text="Finish the login in your browser…")
-            self.update_post()
-
-            def run():
-                try:
-                    self.tt.login(job)
-                    self.q.put(("login", None))
-                except TikTokError as e:
-                    self.q.put(("login", str(e)))
-            threading.Thread(target=run, daemon=True).start()
-
-    # ---------- post settings ----------
-    def update_count(self):
-        n = len(self.caption.get("1.0", "end-1c").encode("utf-16-le")) // 2
-        self.count_lbl.config(text=f"{n} / {CAPTION_MAX}",
-                              foreground="#ff6b6b" if n > CAPTION_MAX else MUTED)
-        self.update_post()
-
-    def privacy_code(self):
-        return next((k for k, v in PRIVACY_NAMES.items() if v == self.privacy.get()), None)
-
-    def blocker(self):
-        """Why Post can't be pressed yet, or ''."""
-        if not self.tt.has_keys:
-            return "Add your TikTok developer keys first (Set up…)."
-        if not self.tt.connected:
-            return "Connect a TikTok account first."
-        if not self.creator:
-            return "Loading the account…"
-        if not self.privacy.get():
-            return "Choose who can view the video."
-        if self.disclose.get() and not (self.brand_own.get() or self.brand_paid.get()):
-            return "You need to indicate if your content promotes yourself, a third party, or both."
-        if self.cover_mode.get() == "image" and not self.cover_pil:
-            return "Choose a cover image, or use a frame from the video."
-        if len(self.caption.get("1.0", "end-1c").encode("utf-16-le")) // 2 > CAPTION_MAX:
-            return f"The caption is longer than {CAPTION_MAX} characters."
-        maxd = self.creator.get("max_video_post_duration_sec")
-        if maxd and self.dur > maxd + 0.5:
-            return (f"This account can post videos up to {fmt_time(maxd)}; "
-                    f"this one is {fmt_time(self.dur)}.")
-        return ""
-
-    def update_post(self):
-        if self.closed:
-            return
-        paid = self.disclose.get() and self.brand_paid.get()
-        own = self.disclose.get() and self.brand_own.get()
-        # privacy options come from the account; branded content can't be private
-        opts = [PRIVACY_NAMES[o] for o in (self.creator or {}).get("privacy_level_options", [])
-                if o in PRIVACY_NAMES and not (paid and o == "SELF_ONLY")]
-        self.privacy_cb.config(values=opts)
-        if self.privacy.get() and self.privacy.get() not in opts:
-            if paid and self.privacy.get() == "Only me":
-                self.status.config(text="Branded content visibility cannot be set to private.")
-            self.privacy.set("")
-            return   # the trace calls update_post again
-        if self.disclose.get():
-            self.disc_inner.pack(fill="x")
-            self.disc_lbl.config(text="Your video will be labeled as 'Paid partnership'" if paid else
-                                 "Your video will be labeled as 'Promotional content'" if own else
-                                 "Pick at least one.")
-        else:
-            self.disc_inner.pack_forget()
-        key = "paid" if paid else "music"
-        if key != self.consent_key:
-            self.consent_key = key
-            for w in self.consent.winfo_children():
-                w.destroy()
-            ttk.Label(self.consent, text="By posting, you agree to TikTok's",
-                      style="Muted.TLabel", font=SMALL_FONT).pack(anchor="w")
-            if paid:
-                links = ttk.Frame(self.consent)
-                links.pack(anchor="w")
-                link_label(links, "Branded Content Policy",
-                           tiktok_api.BRANDED_URL).pack(side="left")
-                ttk.Label(links, text="and", style="Muted.TLabel",
-                          font=SMALL_FONT).pack(side="left", padx=3)
-            link_label(self.consent, "Music Usage Confirmation",
-                       tiktok_api.MUSIC_URL).pack(anchor="w")
-        if self.job:
-            self.hint.config(text="")
-            return
-        why = self.blocker()
-        self.post_btn.state(["disabled"] if why else ["!disabled"])
-        self.hint.config(text=why)
-
-    def update_cover_label(self):
-        self.cover_frame_rb.config(text=f"Frame at {fmt_time(self.cover_t)}")
-        self.cover_name.config(text=Path(self.state["cover_img"]).name[:26]
-                               if self.cover_pil else "none chosen")
-
-    def use_frame(self):
-        self.cover_t = self.t
-        self.cover_mode.set("frame")
-        self.update_cover_label()
-        self.redraw()
-
-    def choose_cover(self):
-        path = filedialog.askopenfilename(parent=self, filetypes=[
-            ("Images", "*.png *.jpg *.jpeg *.webp *.bmp"), ("All files", "*.*")])
-        if path and self.set_cover_image(path):
-            self.cover_mode.set("image")
-            self.time_var.set(0.0)
-            self.on_scrub()
-
-    def set_cover_image(self, path):
-        try:
-            im = Image.open(path).convert("RGB")
-        except OSError:
-            messagebox.showerror("TikTok", "Could not open that image.", parent=self)
-            return False
-        # fill the frame, cropping the overflow (same as the export filter)
-        s = max(self.vw / im.width, self.vh / im.height)
-        im = im.resize((max(1, round(im.width * s)), max(1, round(im.height * s))), Image.LANCZOS)
-        l, t = (im.width - self.vw) // 2, (im.height - self.vh) // 2
-        self.cover_pil = im.crop((l, t, l + self.vw, t + self.vh))
-        self.state["cover_img"] = path
-        self.update_cover_label()
-        return True
-
-    # ---------- text ----------
-    def add_text(self):
-        prev = self.texts[self.sel] if self.sel is not None else {}
-        self.texts.append({"text": "Your text", "style": prev.get("style", "Outline"),
-                           "color": prev.get("color", "White"), "size": prev.get("size", 7.0),
-                           "x": 0.5, "y": 0.4, "start": 0.0, "end": self.dur})
-        self.select_text(len(self.texts) - 1)
-        self.text_box.focus_set()
-        self.text_box.tag_add("sel", "1.0", "end-1c")
-
-    def remove_text(self):
-        if self.sel is not None:
-            del self.texts[self.sel]
-            self.photos.clear()
-            self.select_text(None)
-
-    def select_text(self, i):
-        self.sel = i
-        self.loading = True
-        on = i is not None
-        for w in self.editor:
-            w.state(["!disabled"] if on else ["disabled"])
-            if on and isinstance(w, ttk.Combobox):
-                w.state(["readonly"])
-        self.text_box.config(state="normal")
-        self.text_box.delete("1.0", "end")
-        if on:
-            it = self.texts[i]
-            self.text_box.insert("1.0", it["text"])
-            self.style_var.set(it["style"])
-            self.color_var.set(it["color"])
-            self.size_var.set(it["size"])
-            self.from_var.set(f"{it['start']:.2f}")
-            self.to_var.set(f"{it['end']:.2f}")
-        else:
-            self.text_box.config(state="disabled")
-            self.from_var.set("")
-            self.to_var.set("")
-        self.loading = False
-        self.redraw()
-
-    def edit_changed(self):
-        if self.loading or self.sel is None:
-            return
-        it = self.texts[self.sel]
-        it["text"] = self.text_box.get("1.0", "end-1c")
-        it["style"], it["color"] = self.style_var.get(), self.color_var.get()
-        it["size"] = round(self.size_var.get(), 1)
-        s, e = parse_secs(self.from_var.get()), parse_secs(self.to_var.get())
-        if s is not None:
-            it["start"] = min(max(s, 0.0), self.dur)
-        if e is not None:
-            it["end"] = min(max(e, 0.0), self.dur)
-        self.redraw()
-
-    def set_time(self, which):
-        if self.sel is None:
-            return
-        if which == "start":
-            self.from_var.set(f"{self.t:.2f}")
-        elif which == "end":
-            self.to_var.set(f"{self.t:.2f}")
-        else:
-            self.from_var.set("0.00")
-            self.to_var.set(f"{self.dur:.2f}")
-
-    def text_photo(self, i, s):
-        it = self.texts[i]
-        key = (it["text"], it["style"], it["color"], it["size"], round(s, 4))
-        cached = self.photos.get(i)
-        if not cached or cached[0] != key:
-            img = render_text(it, self.vw)
-            img = img.resize((max(1, round(img.width * s)), max(1, round(img.height * s))),
-                             Image.LANCZOS)
-            cached = self.photos[i] = (key, ImageTk.PhotoImage(img))
-        return cached[1]
-
-    # ---------- preview ----------
-    def on_scrub(self):
-        self.t = self.time_var.get()
-        self.schedule_frame(40)
-        self.redraw()
-
-    def schedule_frame(self, delay):
-        if self.frame_job:
-            self.after_cancel(self.frame_job)
-        self.frame_job = self.after(delay, self.fetch_frame)
-
-    def fetch_frame(self):
-        self.frame_job = None
-        self.frame_req += 1
-        token = self.frame_req
-        h = min(self.vh, max(self.cv.winfo_height(), 200)) // 2 * 2
-        t = min(self.t, max(self.dur - 0.05, 0.0))
-        cmd = ["ffmpeg", "-v", "error", "-ss", f"{t:.3f}", "-i", self.path, "-frames:v", "1",
-               "-vf", f"scale=-2:{h}", "-f", "image2pipe", "-c:v", "bmp", "-"]
-        threading.Thread(target=lambda: self.q.put(("frame", token, run_bmp(cmd))),
-                         daemon=True).start()
-
-    def redraw(self):
-        if self.closed:
-            return
-        cv = self.cv
-        cv.delete("all")
-        cw, ch = max(cv.winfo_width(), 1), max(cv.winfo_height(), 1)
-        s = min(cw / self.vw, ch / self.vh)
-        dw, dh = max(2, int(self.vw * s)), max(2, int(self.vh * s))
-        ox, oy = (cw - dw) // 2, (ch - dh) // 2
-        self.geo = (s, dw, dh, ox, oy)
-        self.time_lbl.config(text=f"{fmt_time(self.t)} / {fmt_time(self.dur)}")
-
-        # with an own cover image, the first frame of the posted video is that image
-        own_cover = self.cover_mode.get() == "image" and self.cover_pil and self.t < 0.02
-        base = self.cover_pil if own_cover else self.frame
-        if base is not None:
-            key = (id(base), dw, dh)
-            if key != self.frame_key:
-                self.frame_photo = ImageTk.PhotoImage(base.resize((dw, dh), Image.BILINEAR))
-                self.frame_key = key
-            cv.create_image(ox, oy, image=self.frame_photo, anchor="nw")
-        else:
-            cv.create_rectangle(ox, oy, ox + dw, oy + dh, fill="#000000", outline="")
-
-        self.hitboxes = []
-        if not own_cover:
-            for i, it in enumerate(self.texts):
-                active = it["start"] <= self.t <= it["end"]
-                if not (active or i == self.sel):
-                    continue
-                cx, cy = ox + it["x"] * dw, oy + it["y"] * dh
-                if it["text"].strip():
-                    ph = self.text_photo(i, s)
-                    cv.create_image(cx, cy, image=ph)
-                    w2, h2 = ph.width() / 2, ph.height() / 2
-                else:
-                    w2, h2 = 60, 14
-                    cv.create_text(cx, cy, text="type your text", fill=MUTED, font=UI_FONT)
-                self.hitboxes.append((i, cx - w2, cy - h2, cx + w2, cy + h2))
-                if i == self.sel:
-                    cv.create_rectangle(cx - w2, cy - h2, cx + w2, cy + h2, dash=(3, 3),
-                                        outline="#ffcc00" if active else MUTED)
-                    if not active:
-                        cv.create_text(cx, cy + h2 + 10, text="not shown at this time",
-                                       fill=MUTED, font=SMALL_FONT)
-        if self.drag and self.drag.get("snap"):
-            cv.create_line(ox + dw / 2, oy, ox + dw / 2, oy + dh, fill=ACCENT, dash=(4, 3))
-        if self.safe.get():
-            L, T, R, B = SAFE_ZONE
-            cv.create_rectangle(ox + L * dw, oy + T * dh, ox + (1 - R) * dw, oy + (1 - B) * dh,
-                                outline="#9a9aa8", dash=(5, 4))
-        is_cover = own_cover or (self.cover_mode.get() == "frame"
-                                 and abs(self.t - self.cover_t) < 0.04)
-        if is_cover:
-            t = cv.create_text(ox + 10, oy + 10, text="Cover", anchor="nw", fill="white",
-                               font=("Segoe UI Semibold", 10))
-            bx = cv.bbox(t)
-            cv.tag_lower(cv.create_rectangle(bx[0] - 6, bx[1] - 3, bx[2] + 6, bx[3] + 3,
-                                             fill="#fe2c55", outline=""), t)
-
-    def on_press(self, e):
-        self.focus_set()
-        hit = next((h for h in reversed(self.hitboxes)
-                    if h[1] <= e.x <= h[3] and h[2] <= e.y <= h[4]), None)
-        if not hit:
-            self.drag = None
-            self.select_text(None)
-            return
-        i = hit[0]
-        if i != self.sel:
-            self.select_text(i)
-        it = self.texts[i]
-        self.drag = {"i": i, "x": e.x, "y": e.y, "ox": it["x"], "oy": it["y"]}
-
-    def on_drag(self, e):
-        if not self.drag:
-            return
-        _, dw, dh, _, _ = self.geo
-        it = self.texts[self.drag["i"]]
-        nx = min(max(self.drag["ox"] + (e.x - self.drag["x"]) / dw, 0.0), 1.0)
-        ny = min(max(self.drag["oy"] + (e.y - self.drag["y"]) / dh, 0.0), 1.0)
-        self.drag["snap"] = abs(nx - 0.5) < 0.015
-        it["x"], it["y"] = (0.5 if self.drag["snap"] else nx), ny
-        self.redraw()
-
-    def on_release(self, e):
-        self.drag = None
-        self.redraw()
-
-    # ---------- posting ----------
-    def post(self):
-        if self.job:
-            self.job.set()
-            self.status.config(text="Cancelling…")
-            return
-        if self.blocker():
-            return
-        own = self.disclose.get() and self.brand_own.get()
-        paid = self.disclose.get() and self.brand_paid.get()
-        cover_img = self.state.get("cover_img") if self.cover_mode.get() == "image" else None
-        info = {
-            "title": self.caption.get("1.0", "end-1c"),
-            "privacy_level": self.privacy_code(),
-            "disable_comment": not self.allow["comment"][0].get(),
-            "disable_duet": not self.allow["duet"][0].get(),
-            "disable_stitch": not self.allow["stitch"][0].get(),
-            "video_cover_timestamp_ms": 0 if cover_img else int(self.cover_t * 1000),
-            "brand_content_toggle": paid, "brand_organic_toggle": own,
-            "is_aigc": self.aigc.get(),
-        }
-        texts = [dict(it) for it in self.texts if it["text"].strip() and it["end"] > it["start"]]
-        self.job = threading.Event()
-        self.post_btn.config(text="Cancel")
-        self.post_btn.state(["!disabled"])
-        self.prog["value"] = 0
-        threading.Thread(target=self.run_post, args=(info, texts, cover_img, self.job),
-                         daemon=True).start()
-
-    def run_post(self, info, texts, cover_img, job):
-        tmp = tempfile.mkdtemp(prefix="q-edit_")
-
-        def progress(text, frac):
-            self.q.put(("progress", text, frac))
-        try:
-            progress("Checking the account…", 0)
-            creator = self.tt.creator_info()   # TikTok asks for fresh creator info per post
-            maxd = creator.get("max_video_post_duration_sec")
-            if maxd and self.dur > maxd + 0.5:
-                raise TikTokError("too_long", f"This account can post videos up to {fmt_time(maxd)}.")
-            src = self.prepare(tmp, texts, cover_img, job, progress)
-            st = self.tt.post_video(src, info, progress, job)
-            self.q.put(("posted", st.get("status"), info["privacy_level"]))
-        except TikTokError as e:
-            self.q.put(("post_err", e.code, str(e)))
-        except Exception as e:   # ffmpeg / file errors: show them instead of dying silently
-            self.q.put(("post_err", "error", str(e)))
-        finally:
-            shutil.rmtree(tmp, ignore_errors=True)
-
-    def prepare_cmd(self, tmp, texts, cover_img):
-        """FFmpeg command that writes the file to upload, or None if the export can go as is."""
-        needs_encode = bool(texts or cover_img) or self.info["vcodec"] not in TIKTOK_CODECS
-        if not needs_encode and Path(self.path).suffix.lower() in tiktok_api.MIME:
-            return None, self.path
-        out = os.path.join(tmp, "tiktok.mp4")
-        cmd = ["ffmpeg", "-y", "-v", "error", "-nostats", "-progress", "pipe:1", "-i", self.path]
-        if needs_encode:
-            fc, cur, n = [], "[0:v]", 1
-            for i, it in enumerate(texts):
-                img = render_text(it, self.vw)
-                png = os.path.join(tmp, f"text{i}.png")
-                img.save(png)
-                x = round(it["x"] * self.vw - img.width / 2)
-                y = round(it["y"] * self.vh - img.height / 2)
-                cmd += ["-i", png]
-                fc.append(f"{cur}[{n}:v]overlay={x}:{y}:"
-                          f"enable='between(t,{it['start']:.3f},{it['end']:.3f})'[t{n}]")
-                cur, n = f"[t{n}]", n + 1
-            if cover_img:
-                png = os.path.join(tmp, "cover.png")
-                self.cover_pil.save(png)
-                cmd += ["-i", png]
-                fc.append(f"{cur}[{n}:v]overlay=0:0:enable='eq(n,0)'[cov]")
-                cur = "[cov]"
-            fc.append(f"{cur}format=yuv420p[out]")
-            cmd += ["-filter_complex", ";".join(fc), "-map", "[out]", "-map", "0:a?",
-                    "-c:v", "libx264", "-preset", "medium", "-crf", "17"]
-        else:
-            cmd += ["-map", "0:v", "-map", "0:a?", "-c:v", "copy"]
-        cmd += (["-c:a", "copy"] if self.info["acodec"] in (None, "aac")
-                else ["-c:a", "aac", "-b:a", "192k"])
-        return cmd + ["-movflags", "+faststart", out], out
-
-    def prepare(self, tmp, texts, cover_img, job, progress):
-        cmd, out = self.prepare_cmd(tmp, texts, cover_img)
-        if not cmd:
-            return out
-        progress("Adding text and cover…", 0)
-        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                             stdin=subprocess.DEVNULL, text=True, creationflags=NOWIN)
-        err = []
-        threading.Thread(target=lambda: err.append(p.stderr.read()), daemon=True).start()
-        for line in p.stdout:
-            if job.is_set():
-                p.kill()
-                break
-            if line.startswith("out_time_us="):
-                try:
-                    f = min(1.0, int(line.split("=", 1)[1]) / 1e6 / self.dur)
-                    progress(f"Adding text and cover…  {f:.0%}", f)
-                except ValueError:
-                    pass
-        p.wait()
-        if job.is_set():
-            raise TikTokError("cancelled", "Cancelled.")
-        if p.returncode != 0:
-            time.sleep(0.1)
-            raise TikTokError("encode_failed", "Could not add the text: " +
-                              ("".join(err)).strip()[-400:])
-        return out
-
-    # ---------- events ----------
-    def poll(self):
-        if self.closed:
-            return
-        try:
-            while True:
-                msg = self.q.get_nowait()
-                kind = msg[0]
-                if kind == "frame":
-                    if msg[1] == self.frame_req and msg[2] is not None:
-                        self.frame = msg[2]
-                        self.redraw()
-                elif kind == "creator":
-                    self.show_creator(msg[1])
-                elif kind == "creator_err":
-                    if msg[1] in ("login_required", "access_token_invalid", "invalid_grant",
-                                  "auth_removed"):
-                        self.tt.forget()
-                        self.refresh_account()
-                    self.acct_lbl.config(text="Account problem")
-                    self.acct_sub.config(text=msg[2])
-                elif kind == "login":
-                    self.job = None
-                    self.status.config(text=msg[1] or "")
-                    self.refresh_account()
-                elif kind == "progress":
-                    self.status.config(text=msg[1])
-                    self.prog["value"] = msg[2] * 100
-                elif kind == "posted":
-                    self.end_job()
-                    self.prog["value"] = 100
-                    text = ("Posted! TikTok can take a few minutes to show it on your profile."
-                            if msg[1] == "PUBLISH_COMPLETE" else
-                            "Uploaded. TikTok is still processing it; it will show on your "
-                            "profile in a few minutes.")
-                    if msg[2] == "SELF_ONLY":
-                        text += " It's set to Only me; change that in the TikTok app."
-                    self.status.config(text=text)
-                elif kind == "post_err":
-                    self.end_job()
-                    self.prog["value"] = 0
-                    if msg[1] == "cancelled":
-                        self.status.config(text="Cancelled.")
-                    else:
-                        self.status.config(text="Posting failed.")
-                        messagebox.showerror("Post to TikTok", msg[2], parent=self)
-                    if msg[1] in ("access_token_invalid", "auth_removed", "login_required"):
-                        self.tt.forget()
-                        self.refresh_account()
-        except queue.Empty:
-            pass
-        self.after(50, self.poll)
-
-    def end_job(self):
-        self.job = None
-        self.post_btn.config(text="Post")
-        self.update_post()
-
-    def close(self):
-        if self.job:
-            if not messagebox.askyesno("Post to TikTok", "Stop the upload and close?", parent=self):
-                return
-            self.job.set()
-        self.state.update(caption=self.caption.get("1.0", "end-1c"), cover_t=self.cover_t,
-                          cover_mode=self.cover_mode.get())
-        self.closed = True
-        self.app.tt_panel = None
-        self.destroy()
 
 
 # ---------------------------------------------------------------- inspector control
@@ -1973,8 +994,6 @@ class App:
         self.settings = load_settings()
         self.exp_settings = self.settings.get("export", {})
         self.last_dir = None
-        self.tiktok = TikTok(TIKTOK_FILE)
-        self.tt_state, self.tt_panel, self.last_export = {}, None, None
 
         self.build_ui()
         dark_titlebar(root)
@@ -2043,8 +1062,7 @@ class App:
 
         menu("File", [("Open video…", "Ctrl+O", self.open_video),
                       ("Import media…", "Ctrl+I", self.add_media), None,
-                      ("Export…", "Ctrl+E", self.export),
-                      ("Post to TikTok…", "Ctrl+T", self.post_tiktok), None,
+                      ("Export…", "Ctrl+E", self.export), None,
                       ("Exit", "Alt+F4", self.on_close)])
         menu("Edit", [("Undo", "Ctrl+Z", self.undo), ("Redo", "Ctrl+Y", self.redo), None,
                       ("Split at playhead", "Ctrl+B", self.split),
@@ -2099,10 +1117,6 @@ class App:
         self.prog.pack(side="left")
         self.status = ttk.Label(st, text="Detecting encoders...", style="PanelMuted.TLabel")
         self.status.pack(side="left", padx=10)
-        # shown once something is exported
-        self.tt_btn = self.btn(st, ICON["send"] + "  Post to TikTok",
-                               lambda: self.post_tiktok(self.last_export),
-                               style="ToolText.TButton", tip="Post the export to TikTok  (Ctrl+T)")
         # preview above, timeline below; drag the bar between them to resize
         self.paned = tk.PanedWindow(self.root, orient="vertical", bg=BG, bd=0, sashwidth=6,
                                     sashrelief="flat", sashcursor="sb_v_double_arrow",
@@ -2212,7 +1226,6 @@ class App:
                         ("<Control-o>", lambda e: self.open_video()),
                         ("<Control-i>", lambda e: self.add_media()),
                         ("<Control-e>", lambda e: self.export()),
-                        ("<Control-t>", lambda e: self.post_tiktok()),
                         ("<Control-a>", lambda e: self.select(c["id"] for c in self.clips)),
                         ("<Control-b>", lambda e: self.split()),
                         ("<Control-B>", lambda e: self.split()),
@@ -4212,10 +3225,6 @@ class App:
             self.prog["value"] = 100
             size = os.path.getsize(self.export_out) / 1048576
             self.status.config(text=f"Done!  Saved {Path(self.export_out).name}  ({size:.1f} MB)")
-            self.last_export = self.export_out
-            self.tt_btn.pack(side="left", after=self.status)
-            if self.settings.get("tiktok_after"):
-                self.post_tiktok(self.export_out)
         elif self.cancelled:
             self.prog["value"] = 0
             self.status.config(text="Export cancelled")
@@ -4228,31 +3237,8 @@ class App:
             self.status.config(text="Export failed")
             messagebox.showerror("Export failed", err or "Unknown FFmpeg error")
 
-    # ---------- TikTok ----------
-    def post_tiktok(self, path=None):
-        if not path:
-            path = (self.last_export if self.last_export and os.path.exists(self.last_export)
-                    else filedialog.askopenfilename(
-                        title="Video to post", initialdir=self.last_dir or None,
-                        filetypes=[("Video", "*.mp4 *.mov *.webm *.mkv"), ("All files", "*.*")]))
-            if not path:
-                return
-        if self.tt_panel:
-            if self.tt_panel.path == path:
-                self.tt_panel.lift()
-                self.tt_panel.focus_force()
-                return
-            self.tt_panel.close()
-            if self.tt_panel:   # the user kept a running upload
-                return
-        self.pause()
-        self.tt_panel = TikTokPanel(self, path)
-
     def on_close(self):
         self.pause()
-        if self.tt_panel and self.tt_panel.job:
-            if not messagebox.askyesno("q-edit", "A TikTok upload is running. Quit anyway?"):
-                return
         if self.export_proc:
             if not messagebox.askyesno("q-edit", "An export is running. Quit anyway?"):
                 return

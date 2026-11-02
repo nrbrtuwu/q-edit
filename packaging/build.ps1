@@ -23,9 +23,8 @@ if (-not $iscc) { throw "Inno Setup not found (winget install JRSoftware.InnoSet
 Write-Host "Building q-edit $version with $($ffmpeg.Name)"
 & $py "$here\make_icon.py"
 if ($LASTEXITCODE) { throw "icon failed" }
-# fonts\ holds TikTok Sans (SIL OFL) for the TikTok panel's on-video text
 & $py -m PyInstaller --noconfirm --clean --windowed --name "q-edit" `
-    --icon "$root\clip_editor.ico" --add-data "$root\clip_editor.ico;." --add-data "$root\fonts;fonts" `
+    --icon "$root\clip_editor.ico" --add-data "$root\clip_editor.ico;." `
     --collect-data tkinterdnd2 `
     --distpath "$here\dist" --workpath "$here\build" --specpath "$here" "$root\clip_editor.py"
 if ($LASTEXITCODE) { throw "PyInstaller failed" }
