@@ -9,6 +9,9 @@ Needs:  Python 3, FFmpeg on PATH (ffplay too, for preview sound), Pillow, tkinte
 Run:    python clip_editor.py
 
 Shortcuts:
+  Ctrl+N        new project (blank or from a template)
+  Ctrl+O        open a project, or start one from a video
+  Ctrl+S        save project   (Ctrl+Shift+S: save as)
   Space         play / pause
   Left/Right    step 1 s   (hold Shift for 5 s)
   I / O         mark in / out at the playhead (export and loop range)
@@ -62,7 +65,7 @@ IMAGE_DUR = 5.0
 MIN_CLIP = 0.05
 MEDIA_TYPES = [("Media", "*.mp4 *.mov *.mkv *.avi *.webm *.m4v *.mp3 *.wav *.m4a *.aac *.flac "
                          "*.ogg *.png *.jpg *.jpeg *.bmp *.webp"), ("All files", "*.*")]
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.7.0"
 FROZEN = getattr(sys, "frozen", False)  # True when running from the installed .exe
 APP_DIR = Path(sys.executable).parent if FROZEN else Path(__file__).parent
 DATA_DIR = Path(getattr(sys, "_MEIPASS", APP_DIR))
@@ -70,6 +73,9 @@ ICON_FILE = DATA_DIR / "clip_editor.ico"
 # the install folder is read-only, so the installed app keeps settings in %APPDATA%
 SETTINGS_FILE = (Path(os.environ.get("APPDATA", Path.home())) / "q-edit" / "settings.json"
                  if FROZEN else APP_DIR / "clip_editor_settings.json")
+PROJECT_EXT = ".qedit"
+PROJECT_TYPES = [("q-edit project", "*.qedit")]
+TEMPLATES_DIR = SETTINGS_FILE.parent / "templates"   # one folder per template, media copied in
 
 
 def migrate_settings_dir():
@@ -83,7 +89,7 @@ def migrate_settings_dir():
 
 
 def load_settings():
-    """{"export": {...last export settings}, "preview_volume": int}"""
+    """{"export": {...last export settings}, "preview_volume": int, "recent": [project paths]}"""
     try:
         s = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -775,6 +781,216 @@ class ExportDialog(tk.Toplevel):
         self.app.start_export(out, settings, codec, kbps)
 
 
+# ---------------------------------------------------------------- projects and templates
+def center_on(win, parent):
+    win.update_idletasks()
+    x = parent.winfo_rootx() + (parent.winfo_width() - win.winfo_width()) // 2
+    y = parent.winfo_rooty() + (parent.winfo_height() - win.winfo_height()) // 3
+    win.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+
+
+def list_templates():
+    """[(folder, data)] of saved templates, by name."""
+    out = []
+    if TEMPLATES_DIR.is_dir():
+        for d in TEMPLATES_DIR.iterdir():
+            f = d / ("template" + PROJECT_EXT)
+            try:
+                out.append((d, json.loads(f.read_text(encoding="utf-8"))))
+            except (OSError, ValueError):
+                continue
+    return sorted(out, key=lambda x: x[1].get("template", {}).get("name", x[0].name).lower())
+
+
+class TemplateSaveDialog(tk.Toplevel):
+    """Save the current project as a template: a name, which clips to keep, and whether the
+    kept clips stretch to the length of the video added later."""
+
+    def __init__(self, app):
+        super().__init__(app.root)
+        self.app = app
+        self.title("Save as template")
+        self.configure(bg=BG)
+        self.resizable(False, False)
+        self.transient(app.root)
+        body = ttk.Frame(self, padding=18)
+        body.pack(fill="both")
+        ttk.Label(body, text="Template name", style="Head.TLabel").pack(anchor="w")
+        self.name = tk.StringVar(value="My template")
+        en = ttk.Entry(body, textvariable=self.name, width=40)
+        en.pack(fill="x", pady=(4, 12))
+        en.select_range(0, "end")
+        en.focus_set()
+
+        ttk.Label(body, text="Keep these clips", style="Head.TLabel").pack(anchor="w")
+        ttk.Label(body, text="Leave out the clips you will replace each time, like your main video.",
+                  style="Muted.TLabel").pack(anchor="w", pady=(0, 4))
+        clips = sorted(app.clips, key=lambda c: (c["kind"] != "v", -c["track"] if c["kind"] == "v"
+                                                 else c["track"], c["start"]))
+        # by default keep what isn't on V1 / A1 (logos, overlays, music), or everything if that's all
+        upper = [c for c in clips if c["track"] > 0]
+        self.keep = {}
+        box = ttk.Frame(body)
+        box.pack(fill="x")
+        for c in clips:
+            var = tk.BooleanVar(value=(c in upper) if upper else True)
+            self.keep[c["id"]] = var
+            ttk.Checkbutton(box, variable=var, takefocus=False,
+                            text=f"{c['kind'].upper()}{c['track'] + 1}   {Path(c['path']).name}   "
+                                 f"{fmt_time(c['start'])} – {fmt_time(c['start'] + c['dur'])}"
+                            ).pack(anchor="w")
+        self.stretch = tk.BooleanVar(value=True)
+        ttk.Checkbutton(body, text="Stretch kept clips to the length of the video you add",
+                        variable=self.stretch, takefocus=False).pack(anchor="w", pady=(12, 0))
+        ttk.Label(body, text=f"Frame size {app.vw} x {app.vh}, crop, output size and export "
+                             f"settings are saved too. Media files are copied into the template.",
+                  style="Muted.TLabel", wraplength=420, justify="left").pack(anchor="w", pady=(8, 0))
+        btns = ttk.Frame(body)
+        btns.pack(anchor="e", pady=(16, 0))
+        ttk.Button(btns, text="Cancel", command=self.destroy, takefocus=False).pack(side="left")
+        ttk.Button(btns, text="Save template", style="Accent.TButton", command=self.save,
+                   takefocus=False).pack(side="left", padx=(8, 0))
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.bind("<Return>", lambda e: self.save())
+        dark_titlebar(self)
+        center_on(self, app.root)
+        self.grab_set()
+
+    def save(self):
+        name = self.name.get().strip()
+        folder = re.sub(r'[<>:"/\\|?*]', "", name).strip(" .")
+        if not folder:
+            messagebox.showerror("Save as template", "Give the template a name.", parent=self)
+            return
+        kept = [c for c in self.app.clips if self.keep[c["id"]].get()]
+        dest = TEMPLATES_DIR / folder
+        if dest.exists() and not messagebox.askyesno(
+                "Save as template", f"A template called {name} already exists. Replace it?",
+                parent=self):
+            return
+        if self.app.save_template(dest, name, kept, self.stretch.get()):
+            self.destroy()
+
+
+class ProjectPicker(tk.Toplevel):
+    """New project: blank, or start from one of the saved templates."""
+    TW, TH = 192, 108
+
+    def __init__(self, app):
+        super().__init__(app.root)
+        self.app = app
+        self.title("New project")
+        self.configure(bg=BG)
+        self.transient(app.root)
+        self.geometry("700x520")
+        self.minsize(520, 380)
+        self.choice = None          # None = blank, else template folder
+        self.tiles, self.photos = {}, []
+        body = ttk.Frame(self, padding=(18, 16, 18, 14))
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text="Start a new project", style="Head.TLabel").pack(anchor="w")
+        ttk.Label(body, text="Pick a template, or start blank. Save any project as a template "
+                             "with File > Save as template.", style="Muted.TLabel",
+                  wraplength=640, justify="left").pack(anchor="w", pady=(0, 10))
+        btns = ttk.Frame(body)
+        btns.pack(side="bottom", fill="x", pady=(12, 0))
+        self.del_btn = ttk.Button(btns, text="Delete template", command=self.delete,
+                                  takefocus=False)
+        self.del_btn.pack(side="left")
+        ttk.Button(btns, text="Create", style="Accent.TButton", command=self.create,
+                   takefocus=False).pack(side="right")
+        ttk.Button(btns, text="Cancel", command=self.destroy, takefocus=False).pack(side="right",
+                                                                                   padx=(0, 8))
+        wrap = ttk.Frame(body)
+        wrap.pack(fill="both", expand=True)
+        self.cv = tk.Canvas(wrap, bg=BG, highlightthickness=0)
+        sb = ttk.Scrollbar(wrap, orient="vertical", command=self.cv.yview)
+        self.cv.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self.cv.pack(side="left", fill="both", expand=True)
+        self.grid = ttk.Frame(self.cv)
+        self.cv.create_window(0, 0, window=self.grid, anchor="nw")
+        self.cv.bind("<Configure>", lambda e: self.layout())
+        self.cv.bind("<MouseWheel>", lambda e: self.cv.yview_scroll(-e.delta // 120, "units"))
+        self.fill()
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.bind("<Return>", lambda e: self.create())
+        dark_titlebar(self)
+        center_on(self, app.root)
+        self.grab_set()
+
+    def fill(self):
+        for w in self.grid.winfo_children():
+            w.destroy()
+        self.tiles, self.photos = {}, []
+        self.tile(None, "Blank project", "Empty timeline", None)
+        for folder, d in list_templates():
+            t = d.get("template", {})
+            w, h = d.get("frame") or (0, 0)
+            n = len(d.get("clips", []))
+            info = (f"{w} x {h}   ·   " if w else "") + f"{n} clip{'' if n == 1 else 's'}"
+            self.tile(folder, t.get("name", folder.name), info, folder / "preview.png")
+        self.select(self.choice if self.choice in self.tiles else None)
+        self.layout()
+
+    def tile(self, key, title, info, thumb):
+        f = tk.Frame(self.grid, bg=PANEL, highlightthickness=2, highlightbackground=PANEL,
+                     cursor="hand2", padx=8, pady=8)
+        img = Image.new("RGB", (self.TW, self.TH), "#0e0e11")
+        if thumb is not None:
+            try:
+                with Image.open(thumb) as im:
+                    im = im.convert("RGB")
+                    im.thumbnail((self.TW, self.TH))
+                    img.paste(im, ((self.TW - im.width) // 2, (self.TH - im.height) // 2))
+            except OSError:
+                pass
+        ph = ImageTk.PhotoImage(img)
+        self.photos.append(ph)
+        pic = tk.Label(f, image=ph, bg=PANEL, bd=0)
+        if key is None:
+            pic.config(text="+", compound="center", fg=MUTED, font=("Segoe UI", 28))
+        pic.pack()
+        t = tk.Label(f, text=title, bg=PANEL, fg=FG, font=("Segoe UI Semibold", 10), anchor="w",
+                     width=24)
+        t.pack(fill="x", pady=(6, 0))
+        i = tk.Label(f, text=info, bg=PANEL, fg=MUTED, font=SMALL_FONT, anchor="w")
+        i.pack(fill="x")
+        for w in (f, pic, t, i):
+            w.bind("<Button-1>", lambda e, k=key: self.select(k))
+            w.bind("<Double-Button-1>", lambda e, k=key: (self.select(k), self.create()))
+            w.bind("<MouseWheel>", lambda e: self.cv.yview_scroll(-e.delta // 120, "units"))
+        self.tiles[key] = f
+
+    def layout(self):
+        cols = max(1, (self.cv.winfo_width() + 12) // (self.TW + 34))
+        for n, f in enumerate(self.tiles.values()):
+            f.grid(row=n // cols, column=n % cols, padx=(0, 12), pady=(0, 12), sticky="nw")
+        self.grid.update_idletasks()
+        self.cv.configure(scrollregion=(0, 0, 0, self.grid.winfo_reqheight()))
+
+    def select(self, key):
+        self.choice = key
+        for k, f in self.tiles.items():
+            f.config(highlightbackground=ACCENT if k == key else PANEL)
+        self.del_btn.state(["disabled"] if key is None else ["!disabled"])
+
+    def delete(self):
+        if self.choice is None:
+            return
+        if messagebox.askyesno("Delete template", f"Delete the template {self.choice.name}?\n"
+                                                  "Projects made from it are not affected.",
+                               parent=self):
+            shutil.rmtree(self.choice, ignore_errors=True)
+            self.choice = None
+            self.fill()
+
+    def create(self):
+        choice = self.choice
+        self.destroy()
+        self.app.start_project(choice)
+
+
 # ---------------------------------------------------------------- inspector control
 class SlideField:
     """DaVinci-style number control on one grid row: label, optional slider, value box, reset.
@@ -994,8 +1210,14 @@ class App:
         self.settings = load_settings()
         self.exp_settings = self.settings.get("export", {})
         self.last_dir = None
+        self.project_path = None     # the .qedit file, None while untitled
+        self.saved_key = None        # project state at the last save / open (for "unsaved")
+        self.title_tick = 0
+        self.template_fresh = False  # from a template, waiting for the first real video
 
         self.build_ui()
+        self.saved_key = self.state_key()
+        self.update_title()
         dark_titlebar(root)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.after(50, self.poll)
@@ -1059,11 +1281,20 @@ class App:
                     m.add_command(label=it[0], accelerator=it[1], command=it[2])
             mb["menu"] = m
             mb.pack(side="left")
+            return m
 
-        menu("File", [("Open video…", "Ctrl+O", self.open_video),
-                      ("Import media…", "Ctrl+I", self.add_media), None,
-                      ("Export…", "Ctrl+E", self.export), None,
-                      ("Exit", "Alt+F4", self.on_close)])
+        file_menu = menu("File", [("New project…", "Ctrl+N", self.new_project),
+                                  ("Open…", "Ctrl+O", self.open_any), None,
+                                  ("Save", "Ctrl+S", self.save_project),
+                                  ("Save as…", "Ctrl+Shift+S", lambda: self.save_project(True)),
+                                  ("Save as template…", "", self.save_as_template), None,
+                                  ("Import media…", "Ctrl+I", self.add_media), None,
+                                  ("Export…", "Ctrl+E", self.export), None,
+                                  ("Exit", "Alt+F4", self.on_close)])
+        self.recent_menu = tk.Menu(file_menu, tearoff=0, bg=FIELD, fg=FG, activebackground=ACCENT,
+                                   activeforeground="white", bd=0, relief="flat", font=UI_FONT,
+                                   postcommand=self.fill_recent)
+        file_menu.insert_cascade(2, label="Open recent", menu=self.recent_menu)
         menu("Edit", [("Undo", "Ctrl+Z", self.undo), ("Redo", "Ctrl+Y", self.redo), None,
                       ("Split at playhead", "Ctrl+B", self.split),
                       ("Delete", "Del", self.delete_sel),
@@ -1223,7 +1454,10 @@ class App:
                         ("<KeyPress-minus>", lambda e: self.zoom(1 / 1.5)),
                         ("<Home>", lambda e: self.seek(self.render_range()[0])),
                         ("<End>", lambda e: self.seek(self.render_range()[1])),
-                        ("<Control-o>", lambda e: self.open_video()),
+                        ("<Control-o>", lambda e: self.open_any()),
+                        ("<Control-n>", lambda e: self.new_project()),
+                        ("<Control-s>", lambda e: self.save_project()),
+                        ("<Control-S>", lambda e: self.save_project(True)),
                         ("<Control-i>", lambda e: self.add_media()),
                         ("<Control-e>", lambda e: self.export()),
                         ("<Control-a>", lambda e: self.select(c["id"] for c in self.clips)),
@@ -2221,6 +2455,9 @@ class App:
                 self.play()
             return
         if d.get("moved"):
+            if d["mode"] in ("left", "right"):   # trimmed by hand: stop stretching it
+                for i in d["orig"]:
+                    self.by_id(i).pop("fill", None)
             keep = set(d["orig"])
             for i in d["orig"]:
                 c = self.by_id(i)
@@ -2542,6 +2779,9 @@ class App:
                     self.finish_export(msg[1], msg[2])
         except queue.Empty:
             pass
+        self.title_tick += 1
+        if self.title_tick % 12 == 0:   # about twice a second
+            self.update_title()
         self.root.after(40, self.poll)
 
     # ---------- playback ----------
@@ -2685,19 +2925,15 @@ class App:
         self.follow_playhead()
 
     # ---------- files ----------
-    def open_video(self):
-        path = filedialog.askopenfilename(initialdir=self.last_dir, filetypes=MEDIA_TYPES)
-        if not path:
-            return
+    def open_video(self, path):
+        """Starts a new, untitled project with this media file."""
         if self.clips and not messagebox.askyesno(
-                "q-edit", "Start a new timeline with this file?\n"
-                               "(Use Add media to add it to the current one.)"):
+                "q-edit", "Start a new project with this file?\n"
+                               "(Use Import media to add it to the current one.)"):
             return
-        self.pause()
-        self.clips, self.sel = [], set()
-        self.vtracks, self.atracks = [{"hidden": False}], [{"muted": False}]
-        self.vw = self.vh = 0
-        self.cur, self.mark_in, self.mark_out = 0.0, None, None
+        if not self.confirm_discard():
+            return
+        self.reset_project()
         self.add_media([path])
         self.undo_stack.clear()
         self.redo_stack.clear()
@@ -2750,6 +2986,8 @@ class App:
             if not m:
                 continue
             self.last_dir = str(Path(path).parent)
+            if self.template_fresh and m["video"] and not m["image"]:
+                self.adopt_frame(m)
             if not self.vw and m["video"]:
                 img = None if m["image"] else grab_frame(path, 0)
                 size = m["size"] if m["image"] else (img.size if img else None)
@@ -2793,6 +3031,7 @@ class App:
         self.sel.clear()
         if was_empty:
             self.cur = 0.0
+        self.apply_fills()
         self.commit(before)
         if was_empty:
             self.zoom_fit()
@@ -3237,8 +3476,315 @@ class App:
             self.status.config(text="Export failed")
             messagebox.showerror("Export failed", err or "Unknown FFmpeg error")
 
+    # ---------- projects ----------
+    def project_data(self, base=None):
+        """Everything needed to reopen the edit. With base, each clip also stores its path
+        relative to base, so a project folder can be moved or copied as a whole."""
+        def rel(path):
+            try:
+                return os.path.relpath(path, base)
+            except ValueError:   # on another drive
+                return None
+        return {"app": "q-edit", "format": 1, "frame": [self.vw, self.vh], "fps": self.pfps,
+                "crop": [round(float(v), 2) for v in self.crop], "ratio": self.ratio.get(),
+                "outsize": self.outsize.get(), "vtracks": self.vtracks, "atracks": self.atracks,
+                "clips": [dict(c, rel=rel(c["path"])) if base else dict(c) for c in self.clips],
+                "marks": [self.mark_in, self.mark_out]}
+
+    def state_key(self):
+        return json.dumps(self.project_data(), sort_keys=True)
+
+    def is_dirty(self):
+        if not self.clips and not self.project_path:
+            return False
+        return self.state_key() != self.saved_key
+
+    def update_title(self):
+        name = Path(self.project_path).stem if self.project_path else "Untitled"
+        title = f"{name}{' *' if self.is_dirty() else ''}  -  q-edit"
+        if self.root.title() != title:
+            self.root.title(title)
+
+    def confirm_discard(self):
+        """Asks to save unsaved changes. False = the user cancelled."""
+        if not self.is_dirty():
+            return True
+        self.pause()
+        name = Path(self.project_path).name if self.project_path else "this project"
+        answer = messagebox.askyesnocancel("q-edit", f"Save changes to {name}?")
+        if answer is None:
+            return False
+        return self.save_project() if answer else True
+
+    def reset_project(self):
+        self.pause()
+        self.clips, self.sel = [], set()
+        self.vtracks, self.atracks = [{"hidden": False}], [{"muted": False}]
+        self.vw = self.vh = 0
+        self.pfps = 30.0
+        self.cur, self.mark_in, self.mark_out = 0.0, None, None
+        self.crop = [0.0, 0.0, 0.0, 0.0]
+        self.ratio.set("Free")
+        self.outsize.set("")
+        self.frame = None
+        self.undo_stack.clear()
+        self.redo_stack.clear()
+        self.project_path = None
+        self.template_fresh = False
+        self.after_edit()
+        self.redraw()
+        self.saved_key = self.state_key()
+
+    def save_project(self, as_new=False):
+        """True when saved."""
+        path = self.project_path
+        if as_new or not path:
+            first = min(self.clips, key=lambda c: c["start"])["path"] if self.clips else None
+            path = filedialog.asksaveasfilename(
+                title="Save project", defaultextension=PROJECT_EXT, filetypes=PROJECT_TYPES,
+                initialdir=str(Path(path).parent) if path else (self.last_dir or None),
+                initialfile=Path(path).name if path else (Path(first).stem if first else "Untitled")
+                + PROJECT_EXT)
+            if not path:
+                return False
+        data = self.project_data(Path(path).parent)
+        try:
+            tmp = path + ".tmp"   # write next to it first, so a failed save can't eat the old one
+            Path(tmp).write_text(json.dumps(data, indent=1), encoding="utf-8")
+            os.replace(tmp, path)
+        except OSError as e:
+            messagebox.showerror("Save project", f"Could not save the project:\n{e}")
+            return False
+        self.project_path = path
+        self.saved_key = self.state_key()
+        self.add_recent(path)
+        self.update_title()
+        self.status.config(text=f"Saved {Path(path).name}")
+        return True
+
+    def open_any(self, path=None):
+        """Ctrl+O: a project opens as is, a media file starts a new project."""
+        if path is None:
+            exts = " ".join(f"*{e}" for e in sorted(MEDIA_EXT))
+            path = filedialog.askopenfilename(
+                initialdir=self.last_dir,
+                filetypes=[("Projects and media", f"*{PROJECT_EXT} {exts}")] + PROJECT_TYPES +
+                MEDIA_TYPES)
+            if not path:
+                return
+        if Path(path).suffix.lower() == PROJECT_EXT:
+            self.open_project(path)
+        else:
+            self.open_video(path)
+
+    def open_project(self, path):
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+            if data.get("app") != "q-edit":
+                raise ValueError
+        except (OSError, ValueError):
+            messagebox.showerror("Open project", f"{Path(path).name} is not a q-edit project.")
+            self.drop_recent(path)
+            return
+        if not self.confirm_discard():
+            return
+        self.load_project_data(data, Path(path).parent)
+        self.project_path = str(path)
+        self.saved_key = self.state_key()
+        self.last_dir = str(Path(path).parent)
+        self.add_recent(path)
+        self.update_title()
+        self.status.config(text=f"Opened {Path(path).name}   ·   {len(self.clips)} clips")
+
+    def load_project_data(self, data, base):
+        """Rebuilds the timeline from project / template data. Clips whose file is gone (and
+        not found next to the project either) are left out, with a warning."""
+        self.reset_project()
+        clips, missing = [], []
+        for c in data.get("clips", []):
+            c = dict(c)
+            rel = c.pop("rel", None)
+            if not os.path.exists(c["path"]) and rel and (base / rel).exists():
+                c["path"] = str((base / rel).resolve())
+            if os.path.exists(c["path"]) and self.load_media(c["path"]):
+                clips.append(c)
+            else:
+                missing.append(Path(c["path"]).name)
+        self.vtracks = data.get("vtracks") or [{"hidden": False}]
+        self.atracks = data.get("atracks") or [{"muted": False}]
+        for c in clips:   # a damaged file shouldn't point at a track that isn't there
+            tracks = self.tracks(c["kind"])
+            while len(tracks) <= c["track"]:
+                tracks.append({"hidden": False} if c["kind"] == "v" else {"muted": False})
+        self.clips = clips
+        self.vw, self.vh = (int(v) for v in data.get("frame") or (0, 0))
+        self.pfps = float(data.get("fps") or 30.0)
+        self.ratio.set(data.get("ratio", "Free"))
+        self.outsize.set(data.get("outsize", ""))   # this resets the crop, so the crop comes after
+        crop = data.get("crop")
+        self.crop = [float(v) for v in crop] if crop and len(crop) == 4 and self.vw \
+            else [0.0, 0.0, float(self.vw), float(self.vh)]
+        self.mark_in, self.mark_out = (data.get("marks") or [None, None])[:2]
+        self.next_id = max([c["id"] for c in clips] + [c.get("link") or 0 for c in clips] + [0]) + 1
+        self.undo_stack.clear()
+        self.redo_stack.clear()
+        self.after_edit()
+        self.update_range()
+        self.zoom_fit()
+        self.redraw()
+        if missing:
+            messagebox.showwarning("Missing files", "These files were not found and were left "
+                                   "out:\n\n" + "\n".join(sorted(set(missing))[:15]))
+
+    def add_recent(self, path):
+        path = str(Path(path).resolve())
+        recent = [p for p in self.settings.get("recent", []) if p != path]
+        self.settings["recent"] = [path] + recent[:7]
+        save_settings(self.settings)
+
+    def drop_recent(self, path):
+        path = str(Path(path).resolve())
+        self.settings["recent"] = [p for p in self.settings.get("recent", []) if p != path]
+        save_settings(self.settings)
+
+    def fill_recent(self):
+        m = self.recent_menu
+        m.delete(0, "end")
+        recent = self.settings.get("recent", [])
+        for p in recent:
+            m.add_command(label=f"{Path(p).stem}     {Path(p).parent}", command=lambda p=p: (
+                self.open_project(p) if os.path.exists(p) else
+                (messagebox.showerror("Open recent", f"{p} no longer exists."), self.drop_recent(p))))
+        if not recent:
+            m.add_command(label="No recent projects", state="disabled")
+
+    # ---------- templates ----------
+    def new_project(self):
+        ProjectPicker(self)
+
+    def start_project(self, template):
+        """From the New project picker: None = blank, else a template folder."""
+        if not self.confirm_discard():
+            return
+        if template is None:
+            self.reset_project()
+            self.status.config(text="New project")
+            return
+        try:
+            data = json.loads((template / ("template" + PROJECT_EXT)).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            messagebox.showerror("New project", "That template could not be read.")
+            return
+        self.load_project_data(data, template)
+        self.template_fresh = True
+        if data.get("export"):
+            self.exp_settings = dict(data["export"])
+        self.project_path = None
+        self.saved_key = self.state_key()
+        self.update_title()
+        name = data.get("template", {}).get("name", template.name)
+        self.status.config(text=f"Template {name}: drop or import your video")
+
+    def save_as_template(self):
+        if not self.clips:
+            messagebox.showinfo("Save as template", "Put something on the timeline first, like a "
+                                                    "logo on V2 placed and sized the way you want.")
+            return
+        TemplateSaveDialog(self)
+
+    def save_template(self, dest, name, kept, stretch):
+        """Writes a template folder: template.qedit, copies of the kept clips' media, and a
+        preview picture. True when saved."""
+        tmp = dest.with_name(dest.name + ".saving")
+        shutil.rmtree(tmp, ignore_errors=True)
+        try:
+            tmp.mkdir(parents=True)
+            copies = {}
+            for c in kept:
+                if c["path"] not in copies:
+                    src = Path(c["path"])
+                    target = src.name
+                    while target in copies.values():
+                        target = f"{src.stem}_{len(copies)}{src.suffix}"
+                    shutil.copy2(src, tmp / target)
+                    copies[c["path"]] = target
+            data = self.project_data()
+            data["clips"] = [dict(c, path=str(dest / copies[c["path"]]), rel=copies[c["path"]],
+                                  **({"fill": True} if stretch else {})) for c in kept]
+            data["marks"] = [None, None]
+            data["export"] = dict(self.exp_settings)
+            data["template"] = {"name": name, "stretch": stretch,
+                                "created": time.strftime("%Y-%m-%d %H:%M")}
+            (tmp / ("template" + PROJECT_EXT)).write_text(json.dumps(data, indent=1),
+                                                         encoding="utf-8")
+            self.template_preview(kept, tmp / "preview.png")
+            shutil.rmtree(dest, ignore_errors=True)
+            tmp.rename(dest)
+        except OSError as e:
+            shutil.rmtree(tmp, ignore_errors=True)
+            messagebox.showerror("Save as template", f"Could not save the template:\n{e}")
+            return False
+        self.status.config(text=f"Saved template {name}   ·   File > New project to use it")
+        return True
+
+    def template_preview(self, kept, out):
+        """A small picture of only the kept clips, for the New project picker."""
+        if not self.vw or not any(c["kind"] == "v" for c in kept):
+            return
+        W = 320
+        H = max(2, round(W * self.vh / self.vw) // 2 * 2)
+        t = min(c["start"] for c in kept if c["kind"] == "v") + 0.05
+        saved, self.clips = self.clips, kept
+        try:
+            inputs, parts, vout, _, _ = self.graph(t, t + 0.2, W, H, "30", audio=False)
+        finally:
+            self.clips = saved
+        parts.append(f"{vout}format=rgb24[pv]")
+        img = run_bmp(["ffmpeg", "-v", "error"] + inputs +
+                      ["-filter_complex", ";".join(parts), "-map", "[pv]", "-frames:v", "1",
+                       "-f", "image2pipe", "-c:v", "bmp", "-"])
+        if img:
+            img.save(out)
+
+    def adopt_frame(self, m):
+        """In a project started from a template, the first video you add sets the frame size
+        (so it isn't scaled down to the template's), and the template's layout scales along:
+        positions and the crop box. Zoom is relative to the frame already."""
+        self.template_fresh = False
+        size = m.get("size")
+        if not size or not self.vw or tuple(size) == (self.vw, self.vh):
+            return
+        sx, sy = size[0] / self.vw, size[1] / self.vh
+        for c in self.clips:
+            for key, f in (("pos_x", sx), ("pos_y", sy)):
+                if cp(c, key):
+                    c[key] = float(round(cp(c, key) * f))
+        x, y, w, h = self.crop
+        self.vw, self.vh = size
+        self.pfps = m["fps"]
+        self.crop = [x * sx, y * sy, w * sx, h * sy]
+        if self.get_ratio() and abs(sx - sy) > 1e-3:   # a new shape: re-fit the locked crop
+            self.apply_ratio()
+
+    def apply_fills(self):
+        """Template clips marked "fill" stretch to the end of everything else (an image to any
+        length, a video or sound up to the end of its file)."""
+        fills = [c for c in self.clips if c.get("fill")]
+        end = max((c["start"] + c["dur"] for c in self.clips if not c.get("fill")), default=0.0)
+        if not fills or end <= 0:
+            return
+        for c in fills:
+            m = self.media[c["path"]]
+            dur = end - c["start"]
+            if not m["image"]:
+                dur = min(dur, m["dur"] - c["inp"])
+            if dur >= MIN_CLIP:
+                c["dur"] = dur
+
     def on_close(self):
         self.pause()
+        if not self.confirm_discard():
+            return
         if self.export_proc:
             if not messagebox.askyesno("q-edit", "An export is running. Quit anyway?"):
                 return

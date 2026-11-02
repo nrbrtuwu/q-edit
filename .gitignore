@@ -2,9 +2,9 @@
 __pycache__/
 *.pyc
 
-# local settings and the encrypted TikTok login (never commit these)
+# local settings and saved templates (user data)
 clip_editor_settings.json
-tiktok.dat
+templates/
 
 # personal working notes
 CLAUDE.md

@@ -10,6 +10,8 @@ inspector.
 - Drag and drop videos, images, audio files or whole folders from Explorer
 - Inspector for each clip: zoom, position, rotation, flip, cropping, opacity, fades, volume, pan;
   move and scale clips right on the preview
+- Projects (`.qedit`) with save, open and recent files; reusable templates, like a logo already
+  placed on V2 that stretches to whatever video you drop in
 - Crop to any ratio (16:9, 9:16, 1:1, ...) and export at any size
 - Export presets (High quality, Small file, Discord under 10 MB, GPU export), MP4 / MKV / MOV / WebM,
   H.264 / H.265 / AV1 / VP9, GPU encoding on AMD, NVIDIA and Intel
