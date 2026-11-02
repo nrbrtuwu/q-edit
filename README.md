@@ -8,9 +8,10 @@ inspector.
 - Timeline with any number of video and audio tracks: cut, split, trim, ripple delete, snapping,
   undo / redo, filmstrip thumbnails and audio waveforms
 - Drag and drop videos, images, audio files or whole folders from Explorer
-- Inspector for each clip: zoom, position, rotation, flip, cropping, opacity, fades, volume, pan;
-  move and scale clips right on the preview
-- Projects (`.qedit`) with save, open and recent files; reusable templates, like a logo already
+- Inspector for each clip: zoom, position, rotation, flip, cropping, opacity, fades, volume, pan,
+  speed (10-400%, with or without pitch correction); move and scale clips right on the preview
+- Projects (`.qedit`) with a fixed resolution you pick (any size, e.g. 1080x1920), save, open and
+  recent files; reusable templates, like a logo already
   placed on V2 that stretches to whatever video you drop in
 - Crop to any ratio (16:9, 9:16, 1:1, ...) and export at any size
 - Export presets (High quality, Small file, Discord under 10 MB, GPU export), MP4 / MKV / MOV / WebM,

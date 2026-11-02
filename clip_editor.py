@@ -55,6 +55,12 @@ except ImportError:
 
 
 NOWIN = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+# background work (thumbnails, waveforms) yields the CPU to the UI and playback
+BGWIN = NOWIN | (subprocess.BELOW_NORMAL_PRIORITY_CLASS if os.name == "nt" else 0)
+# project resolutions offered in the Projects window and Timeline > Project resolution
+RESOLUTIONS = ["1920x1080   16:9 Full HD", "1080x1920   9:16 vertical (TikTok, Reels, Shorts)",
+               "3840x2160   16:9 4K", "2560x1440   16:9 1440p", "1280x720   16:9 HD",
+               "1080x1080   1:1 square", "1080x1350   4:5 portrait", "1440x1080   4:3"]
 RATIOS = {"Free": None, "16:9": 16 / 9, "9:16": 9 / 16, "1:1": 1.0, "4:5": 4 / 5, "4:3": 4 / 3}
 HANDLE = 6
 MIN_CROP = 32
@@ -66,7 +72,7 @@ IMAGE_DUR = 5.0
 MIN_CLIP = 0.05
 MEDIA_TYPES = [("Media", "*.mp4 *.mov *.mkv *.avi *.webm *.m4v *.mp3 *.wav *.m4a *.aac *.flac "
                          "*.ogg *.png *.jpg *.jpeg *.bmp *.webp"), ("All files", "*.*")]
-APP_VERSION = "1.7.2"
+APP_VERSION = "1.8.0"
 FROZEN = getattr(sys, "frozen", False)  # True when running from the installed .exe
 APP_DIR = Path(sys.executable).parent if FROZEN else Path(__file__).parent
 DATA_DIR = Path(getattr(sys, "_MEIPASS", APP_DIR))
@@ -123,7 +129,8 @@ TRACK_MIN_H, TRACK_MAX_H = 24, 160
 # per-clip settings edited in the inspector; stored flat on the clip dict, missing = default
 CLIP_DEFAULTS = {"zoom": 1.0, "pos_x": 0.0, "pos_y": 0.0, "rotation": 0.0, "flip_h": False,
                  "flip_v": False, "crop_l": 0.0, "crop_r": 0.0, "crop_t": 0.0, "crop_b": 0.0,
-                 "opacity": 100.0, "fade_in": 0.0, "fade_out": 0.0, "volume": 0.0, "pan": 0.0}
+                 "opacity": 100.0, "fade_in": 0.0, "fade_out": 0.0, "volume": 0.0, "pan": 0.0,
+                 "speed": 100.0, "keep_pitch": True}
 THUMB_H = 72          # height thumbnails are extracted at
 PEAKS_PER_SEC = 100   # waveform resolution
 # glyphs from Segoe Fluent Icons / Segoe MDL2 Assets (built into Windows 10/11)
@@ -333,7 +340,7 @@ def extract_thumbs(path, m):
     cmd = (["ffmpeg", "-v", "error"] + (["-skip_frame", "nokey"] if m["dur"] > 120 else []) +
            ["-i", path, "-an", "-vf", f"fps=1/{step:.4f},scale=-2:{THUMB_H}",
             "-f", "image2pipe", "-c:v", "bmp", "-"])
-    out = subprocess.run(cmd, capture_output=True, creationflags=NOWIN).stdout
+    out = subprocess.run(cmd, capture_output=True, creationflags=BGWIN).stdout
     imgs, i = [], 0
     while i + 6 <= len(out):   # concatenated BMPs; each header holds its own size
         size = int.from_bytes(out[i + 2:i + 6], "little")
@@ -351,7 +358,7 @@ def extract_peaks(path):
     """Waveform: loudest sample per 1/PEAKS_PER_SEC s, 0-255."""
     rate = 8000
     raw = subprocess.run(["ffmpeg", "-v", "error", "-i", path, "-vn", "-ac", "1", "-ar", str(rate),
-                          "-f", "s16le", "-"], capture_output=True, creationflags=NOWIN).stdout
+                          "-f", "s16le", "-"], capture_output=True, creationflags=BGWIN).stdout
     a = array("h")
     a.frombytes(raw[:len(raw) // 2 * 2])
     n = rate // PEAKS_PER_SEC
@@ -370,6 +377,35 @@ def run_bmp(cmd):
     if not out:
         return None
     return Image.open(BytesIO(out)).convert("RGB")
+
+
+def spd(c):
+    """A clip's speed as a factor (2.0 = twice as fast): seconds of file per timeline second."""
+    return cp(c, "speed") / 100
+
+
+def speed_filters(c):
+    """Audio filters for a clip's speed: atempo keeps the pitch (it takes 0.5-100 per
+    instance, so slow speeds chain it), asetrate shifts the pitch along like a tape."""
+    k = spd(c)
+    if abs(k - 1) < 1e-6:
+        return []
+    if not cp(c, "keep_pitch"):
+        return [f"asetrate={round(48000 * k)}", "aresample=48000"]
+    out = []
+    while k < 0.5:
+        out.append("atempo=0.5")
+        k /= 0.5
+    return out + [f"atempo={k:.5f}"]
+
+
+def size_of(text):
+    """'1920x1080   16:9 Full HD' or '1920 x 1080' -> (1920, 1080), even; None if not a size."""
+    m = re.match(r"\s*(\d+)\s*[x×*]\s*(\d+)", text or "")
+    if not m:
+        return None
+    w, h = int(m.group(1)) // 2 * 2, int(m.group(2)) // 2 * 2
+    return (w, h) if 16 <= w <= 8192 and 16 <= h <= 8192 else None
 
 
 def parse_size(text):
@@ -897,7 +933,7 @@ class ProjectPicker(tk.Toplevel):
         self.geometry("830x640")
         self.minsize(520, 380)
         self.choice = None          # None = blank, else template folder
-        self.tiles, self.photos = {}, []
+        self.tiles, self.photos, self.frames = {}, [], {}
         body = ttk.Frame(self, padding=(18, 16, 18, 14))
         body.pack(fill="both", expand=True)
         recent = [p for p in app.settings.get("recent", []) if os.path.exists(p)][:5]
@@ -924,6 +960,15 @@ class ProjectPicker(tk.Toplevel):
                   wraplength=640, justify="left").pack(anchor="w", pady=(0, 10))
         btns = ttk.Frame(body)
         btns.pack(side="bottom", fill="x", pady=(12, 0))
+        res = ttk.Frame(body)
+        res.pack(side="bottom", fill="x", pady=(10, 0))
+        ttk.Label(res, text="Resolution").pack(side="left", padx=(0, 8))
+        last = app.settings.get("frame") or (1920, 1080)
+        self.res = tk.StringVar(value=next((r for r in RESOLUTIONS if size_of(r) == tuple(last)),
+                                           f"{last[0]}x{last[1]}"))
+        ttk.Combobox(res, textvariable=self.res, values=RESOLUTIONS, width=44).pack(side="left")
+        ttk.Label(res, text="pick one or type any size, like 1440x1800", style="Muted.TLabel"
+                  ).pack(side="left", padx=(10, 0))
         self.del_btn = ttk.Button(btns, text="Delete template", command=self.delete,
                                   takefocus=False)
         self.del_btn.pack(side="left")
@@ -954,11 +999,13 @@ class ProjectPicker(tk.Toplevel):
     def fill(self):
         for w in self.grid.winfo_children():
             w.destroy()
-        self.tiles, self.photos = {}, []
+        self.tiles, self.photos, self.frames = {}, [], {}
         self.tile(None, "Blank project", "Empty timeline", None)
         for folder, d in list_templates():
             t = d.get("template", {})
             w, h = d.get("frame") or (0, 0)
+            if w:
+                self.frames[folder] = (int(w), int(h))
             n = len(d.get("clips", []))
             info = (f"{w} x {h}   ·   " if w else "") + f"{n} clip{'' if n == 1 else 's'}"
             self.tile(folder, t.get("name", folder.name), info, folder / "preview.png")
@@ -1003,6 +1050,11 @@ class ProjectPicker(tk.Toplevel):
         self.cv.configure(scrollregion=(0, 0, 0, self.grid.winfo_reqheight()))
 
     def select(self, key):
+        if key != self.choice and key is not None:   # a template suggests its own size
+            frame = self.frames.get(key)
+            if frame:
+                self.res.set(next((r for r in RESOLUTIONS if size_of(r) == frame),
+                                  f"{frame[0]}x{frame[1]}"))
         self.choice = key
         for k, f in self.tiles.items():
             f.config(highlightbackground=ACCENT if k == key else PANEL)
@@ -1019,9 +1071,16 @@ class ProjectPicker(tk.Toplevel):
             self.fill()
 
     def create(self):
+        size = size_of(self.res.get())
+        if not size:
+            messagebox.showerror("Resolution", "Type a size like 1920x1080 (16 to 8192 px).",
+                                 parent=self)
+            return
         choice = self.choice
         self.destroy()
-        self.app.start_project(choice)
+        self.app.settings["frame"] = list(size)
+        save_settings(self.app.settings)
+        self.app.start_project(choice, size)
 
     def open(self, path):
         """A recent project, or (None) pick one / a video with the Open dialog."""
@@ -1030,6 +1089,45 @@ class ProjectPicker(tk.Toplevel):
             self.app.open_project(path)
         else:
             self.app.open_any()
+
+
+def ask_resolution(parent, initial):
+    """Small dialog: a resolution from RESOLUTIONS or typed. (w, h) or None."""
+    win = tk.Toplevel(parent)
+    win.title("Project resolution")
+    win.configure(bg=BG)
+    win.transient(parent)
+    win.resizable(False, False)
+    body = ttk.Frame(win, padding=(18, 16, 18, 14))
+    body.pack(fill="both", expand=True)
+    ttk.Label(body, text="Every clip is fit into this frame; positions scale along.",
+              style="Muted.TLabel").pack(anchor="w", pady=(0, 8))
+    var = tk.StringVar(value=next((r for r in RESOLUTIONS if size_of(r) == size_of(initial)),
+                                  initial))
+    box = ttk.Combobox(body, textvariable=var, values=RESOLUTIONS, width=44)
+    box.pack(fill="x")
+    out = []
+
+    def ok():
+        size = size_of(var.get())
+        if not size:
+            messagebox.showerror("Resolution", "Type a size like 1920x1080 (16 to 8192 px).",
+                                 parent=win)
+            return
+        out.append(size)
+        win.destroy()
+    btns = ttk.Frame(body)
+    btns.pack(fill="x", pady=(14, 0))
+    ttk.Button(btns, text="OK", style="Accent.TButton", command=ok).pack(side="right")
+    ttk.Button(btns, text="Cancel", command=win.destroy).pack(side="right", padx=(0, 8))
+    win.bind("<Return>", lambda e: ok())
+    win.bind("<Escape>", lambda e: win.destroy())
+    dark_titlebar(win)
+    center_on(win, parent)
+    box.focus_set()
+    win.grab_set()
+    parent.wait_window(win)
+    return out[0] if out else None
 
 
 # ---------------------------------------------------------------- inspector control
@@ -1232,6 +1330,7 @@ class App:
         self.pps, self.view_t, self.yoff = 40.0, 0.0, 0.0
         self.tdrag = self.hover = None
         self.drop = None   # files being dragged in from Explorer: {"key", "paths", "target"}
+        self.tl_job = None   # pending draw_timeline_soon()
         self.clipboard = []   # copied clips, start relative to the earliest one
         self.thumbs, self.peaks, self.tiles = {}, {}, {}   # timeline filmstrips and waveforms
         self.crop = [0.0, 0.0, 0.0, 0.0]
@@ -1255,7 +1354,6 @@ class App:
         self.project_path = None     # the .qedit file, None while untitled
         self.saved_key = None        # project state at the last save / open (for "unsaved")
         self.title_tick = 0
-        self.template_fresh = False  # from a template, waiting for the first real video
 
         self.build_ui()
         self.saved_key = self.state_key()
@@ -1354,6 +1452,7 @@ class App:
                           ("Zoom in", "+", lambda: self.zoom(1.5)),
                           ("Zoom out", "−", lambda: self.zoom(1 / 1.5)),
                           ("Zoom to fit", "Shift+Z", self.zoom_fit), None,
+                          ("Project resolution…", "", self.change_resolution), None,
                           ("check", "Snapping", "N", self.snap),
                           ("check", "Loop playback", "", self.loop),
                           ("check", "Mute preview", "", self.mute, self.restart_if_playing)])
@@ -1558,7 +1657,13 @@ class App:
             return
         self.layout()
 
-        if self.frame is not None:
+        if not self.clips:
+            cv.create_rectangle(self.ox, self.oy, self.ox + self.dw, self.oy + self.dh,
+                                fill="#000000", outline="")
+            cv.create_text(self.ox + self.dw / 2, self.oy + self.dh / 2,
+                           text=f"{self.vw} x {self.vh}\nDrop or import media", fill=MUTED,
+                           font=UI_FONT, justify="center")
+        elif self.frame is not None:
             key = (id(self.frame), self.dw, self.dh)
             if key != self.photo_key:
                 img = self.frame
@@ -1652,10 +1757,14 @@ class App:
         return next(c for c in self.clips if c["id"] == i)
 
     def snapshot(self):
-        return copy.deepcopy((self.clips, self.vtracks, self.atracks))
+        return copy.deepcopy((self.clips, self.vtracks, self.atracks, (self.vw, self.vh, self.crop)))
 
     def restore(self, snap):
-        self.clips, self.vtracks, self.atracks = copy.deepcopy(snap)
+        self.clips, self.vtracks, self.atracks, frame = copy.deepcopy(snap)
+        if frame[:2] != (self.vw, self.vh):
+            self.vw, self.vh, self.crop = frame
+            self.frame = None
+            self.redraw()
         self.after_edit()
 
     def commit(self, before):
@@ -1698,13 +1807,13 @@ class App:
             if cs >= s - 1e-6 and ce <= e + 1e-6:
                 self.clips.remove(c)
             elif cs < s and ce > e:
-                self.clips.append(dict(c, id=self.new_id(), start=e, inp=c["inp"] + e - cs,
-                                       dur=ce - e, link=None))
+                self.clips.append(dict(c, id=self.new_id(), start=e,
+                                       inp=c["inp"] + (e - cs) * spd(c), dur=ce - e, link=None))
                 c["dur"] = s - cs
             elif cs < s:
                 c["dur"] = s - cs
             else:
-                c["inp"] += e - cs
+                c["inp"] += (e - cs) * spd(c)
                 c["dur"] = ce - e
                 c["start"] = e
 
@@ -1738,7 +1847,7 @@ class App:
         for c in targets:
             k = t - c["start"]
             link = newlink.setdefault(c["link"], self.new_id()) if c["link"] else None
-            self.clips.append(dict(c, id=self.new_id(), start=t, inp=c["inp"] + k,
+            self.clips.append(dict(c, id=self.new_id(), start=t, inp=c["inp"] + k * spd(c),
                                    dur=c["dur"] - k, link=link))
             c["dur"] = k
         self.commit(before)
@@ -1842,11 +1951,13 @@ class App:
                             ("crop_b", "Bottom", 0, 49, 0.2, "{:.1f}%", True)]),
               ("Composite", [("opacity", "Opacity", 0, 100, 0.5, "{:.0f}%", True)]),
               ("Fade", [("fade_in", "Fade in", 0, 10, 0.02, "{:.2f} s", True),
-                        ("fade_out", "Fade out", 0, 10, 0.02, "{:.2f} s", True)])],
+                        ("fade_out", "Fade out", 0, 10, 0.02, "{:.2f} s", True)]),
+              ("Speed", [("speed", "Speed", 10, 400, 0.5, "{:.0f}%", True)])],
         "a": [("Audio", [("volume", "Volume", -60, 12, 0.1, "{:+.1f} dB", True),
                          ("pan", "Pan", -1, 1, 0.01, "{:+.2f}", True)]),
               ("Fade", [("fade_in", "Fade in", 0, 10, 0.02, "{:.2f} s", True),
-                        ("fade_out", "Fade out", 0, 10, 0.02, "{:.2f} s", True)])],
+                        ("fade_out", "Fade out", 0, 10, 0.02, "{:.2f} s", True)]),
+              ("Speed", [("speed", "Speed", 10, 400, 0.5, "{:.0f}%", True)])],
     }
 
     def build_inspector(self):
@@ -1905,6 +2016,15 @@ class App:
                                                                       self.insp_end())
                                         ).pack(side="left", padx=(0, 12))
                         self.fields[("v", key)] = var
+                    r += 1
+                if title == "Speed":   # pitch follows the sound of the clip and its linked partner
+                    var = tk.BooleanVar(value=True)
+                    ttk.Checkbutton(body, text="Keep pitch (no chipmunk / slow-mo voice)",
+                                    variable=var, style="Panel.TCheckbutton", takefocus=False,
+                                    command=lambda k=kind, v=var: (
+                                        self.insp_set(k, "keep_pitch", v.get()), self.insp_end())
+                                    ).grid(row=r, column=0, columnspan=4, sticky="w", pady=(2, 0))
+                    self.fields[(kind, "keep_pitch")] = var
                     r += 1
             self.btn(body, "Reset all", lambda k=kind: self.insp_reset(k),
                      style="ToolText.TButton").grid(row=r, column=0, columnspan=4, sticky="w",
@@ -2004,14 +2124,19 @@ class App:
                 value = min(max(value, 0.0), min(c["dur"] for c in clips))
         if self.insp_before is None:
             self.insp_before = self.snapshot()
+        if key in ("speed", "keep_pitch"):   # a clip's picture and sound stay in sync
+            ids = {i for c in clips for i in self.linked(c)}
+            clips = [c for c in self.clips if c["id"] in ids and not self.media[c["path"]]["image"]]
+        if key == "speed":
+            self.set_speed(clips, value)
         for c in clips:
             self.set_prop(c, key, value)
         self.insp_sig = self.insp_signature()   # the field already shows it; no full refresh
         if self.insp_job:
             self.root.after_cancel(self.insp_job)
         self.insp_job = self.root.after(500, self.insp_commit)
-        if key in ("volume", "fade_in", "fade_out"):   # the only settings drawn on the timeline
-            self.draw_timeline()
+        if key in ("volume", "fade_in", "fade_out", "speed"):   # the ones drawn on the timeline
+            self.draw_timeline_soon()
         if self.player:
             # restarting playback on every slider step would stall it; wait until it rests
             if self.replay_job:
@@ -2019,6 +2144,27 @@ class App:
             self.replay_job = self.root.after(300, self.replay)
         elif kind == "v":
             self.queue_live()
+
+    def set_speed(self, clips, pct):
+        """A new speed (%) keeps the same part of the file, so the clip gets shorter or longer;
+        what comes after it on its track moves along, so nothing is cut or overlapped."""
+        for c in sorted(clips, key=lambda c: c["start"]):
+            if self.media[c["path"]]["image"]:
+                continue
+            old, new = spd(c), pct / 100
+            self.set_prop(c, "speed", float(pct))
+            if abs(old - new) < 1e-9:
+                continue
+            end = c["start"] + c["dur"]
+            dur = c["dur"] * old / new
+            for o in self.clips:
+                if o is not c and (o["kind"], o["track"]) == (c["kind"], c["track"]) \
+                        and o["start"] >= end - 1e-6:
+                    o["start"] += dur - c["dur"]
+            c["dur"] = dur
+            for k in ("fade_in", "fade_out"):
+                if cp(c, k) > dur:
+                    c[k] = dur
 
     def insp_end(self):
         """A slider / value drag ended: close the undo step and fetch the exact frame."""
@@ -2055,8 +2201,10 @@ class App:
         if not clips:
             return
         before = self.snapshot()
-        keys = {k for _, rows in self.INSPECTOR[kind] for k, *_ in rows}
+        keys = {k for _, rows in self.INSPECTOR[kind] for k, *_ in rows} | {"keep_pitch"}
         keys |= {"flip_h", "flip_v"} if kind == "v" else set()
+        ids = {i for c in clips for i in self.linked(c)}
+        self.set_speed([c for c in self.clips if c["id"] in ids], 100.0)   # back to full length
         for c in clips:
             for k in keys:
                 c.pop(k, None)
@@ -2129,7 +2277,15 @@ class App:
         return None, None
 
     # ---------- timeline drawing ----------
+    def draw_timeline_soon(self):
+        """For mouse moves: one redraw when Tk is idle, however many events came in."""
+        if not self.tl_job:
+            self.tl_job = self.root.after_idle(self.draw_timeline)
+
     def draw_timeline(self):
+        if self.tl_job:
+            self.root.after_cancel(self.tl_job)
+            self.tl_job = None
         c = self.tl
         c.delete("all")
         w, h = max(c.winfo_width(), 1), max(c.winfo_height(), 1)
@@ -2185,6 +2341,8 @@ class App:
             room = int((x1 - x0 - 12) / 6.5)
             if room > 2 and y1 - y0 >= 20:
                 label = f"{Path(cl['path']).name}   {fmt_time(cl['dur'])}"
+                if cp(cl, "speed") != 100:
+                    label += f"   {cp(cl, 'speed'):.0f}%"
                 if cl["link"]:
                     label = "🔗 " + label
                 if len(label) > room:
@@ -2195,7 +2353,7 @@ class App:
         self.draw_drop(rows)
         self.refresh_inspector()
 
-        c.create_rectangle(0, 0, HEAD_W, h, fill=HEAD_BG, outline="")
+        c.create_rectangle(0, 0, HEAD_W, h, fill=HEAD_BG, outline="", tags="hdrbase")
         for kind, i, y0, y1 in rows:
             tr = self.tracks(kind)[i]
             mid = (y0 + y1) // 2
@@ -2259,7 +2417,7 @@ class App:
             if x + tw <= x0:
                 x += tw
                 continue
-            t = cl["inp"] + (x + tw / 2 - X0) / self.pps
+            t = cl["inp"] + (x + tw / 2 - X0) / self.pps * spd(cl)
             idx = 0 if not step else min(len(imgs) - 1, max(0, int(t / step)))
             left, right = max(0, int(x0 - x)), int(min(tw, x1 - x))
             if right - left >= 2:
@@ -2280,11 +2438,12 @@ class App:
             return
         mid, half = (y0 + y1) / 2, (y1 - y0) / 2 - 1
         gain = 10 ** (cp(cl, "volume") / 20)
+        k = spd(cl)
         top, bottom = [], []
         for x in range(int(x0), int(x1) + 1, 2):
-            ta = cl["inp"] + (x - X0) / self.pps
+            ta = cl["inp"] + (x - X0) / self.pps * k
             i0 = max(0, int(ta * PEAKS_PER_SEC))
-            i1 = max(i0 + 1, int((ta + 2 / self.pps) * PEAKS_PER_SEC))
+            i1 = max(i0 + 1, int((ta + 2 / self.pps * k) * PEAKS_PER_SEC))
             v = min(1.0, max(pk[i0:i1], default=0) / 255 * gain) * half
             top += (x, mid - v - 0.5)
             bottom[:0] = (x, mid + v + 0.5)
@@ -2297,7 +2456,8 @@ class App:
             return
         c = self.tl
         t, track = self.drop["target"]
-        c.create_line(self.t2x(t), RULER_H, self.t2x(t), c.winfo_height(), fill=ACCENT, width=2)
+        c.create_line(self.t2x(t), RULER_H, self.t2x(t), c.winfo_height(), fill=ACCENT, width=2,
+                      tags="drop")
         for path in self.drop["paths"]:
             m = self.media.get(path)
             dur = self.drop_dur(path)
@@ -2314,11 +2474,20 @@ class App:
                     y1 = y0 + AT_H
                 x0, x1 = self.t2x(t), self.t2x(t + dur)
                 c.create_rectangle(x0 + 1, y0 + 2, x1 - 1, y1 - 3, fill=ACCENT, stipple="gray25",
-                                   outline=ACCENT, width=2, dash=(4, 2))
+                                   outline=ACCENT, width=2, dash=(4, 2), tags="drop")
                 if x1 - x0 > 30 and y1 - y0 >= 20:
                     c.create_text(x0 + 8, y0 + 5, anchor="nw", fill="white", font=SMALL_FONT,
-                                  text=Path(path).name if m else Path(path).name + "  …")
+                                  text=Path(path).name if m else Path(path).name + "  …",
+                                  tags="drop")
             t += dur
+
+    def draw_drop_layer(self):
+        """Redraws only the ghost clips of a drag from Explorer (under the track headers and the
+        ruler, like draw_timeline puts them), so dragging over the window stays smooth."""
+        self.tl.delete("drop")
+        self.draw_drop(self.rows())
+        if self.tl.find_withtag("hdrbase"):
+            self.tl.tag_lower("drop", "hdrbase")
 
     def draw_playhead(self):
         c = self.tl
@@ -2355,7 +2524,7 @@ class App:
             self.yoff = float(args[1]) * (vis + self.max_yoff())
         elif args[0] == "scroll":
             self.yoff += int(args[1]) * (AT_H if args[2] == "units" else vis * 0.9)
-        self.draw_timeline()
+        self.draw_timeline_soon()
 
     def on_hscroll(self, *args):
         vis = self.vis_secs()
@@ -2364,7 +2533,7 @@ class App:
         elif args[0] == "scroll":
             self.view_t += int(args[1]) * vis * (0.1 if args[2] == "units" else 0.9)
         self.view_t = max(0.0, self.view_t)
-        self.draw_timeline()
+        self.draw_timeline_soon()
 
     def zoom(self, f, x=None):
         x = x if x is not None else (self.t2x(self.cur) if self.clips else HEAD_W)
@@ -2384,10 +2553,10 @@ class App:
             self.zoom(1.25 if e.delta > 0 else 0.8, max(e.x, HEAD_W))
         elif e.state & 0x0001 or e.x < HEAD_W:
             self.yoff -= e.delta / 120 * AT_H
-            self.draw_timeline()
+            self.draw_timeline_soon()
         else:
             self.view_t = max(0.0, self.view_t - e.delta / 120 * 60 / self.pps)
-            self.draw_timeline()
+            self.draw_timeline_soon()
 
     # ---------- timeline mouse ----------
     def on_tl_hover(self, e):
@@ -2414,7 +2583,7 @@ class App:
     def set_hover(self, hover):
         if hover != self.hover and not self.tdrag:
             self.hover = hover
-            self.draw_timeline()
+            self.draw_timeline_soon()
 
     def on_tl_press(self, e):
         self.root.focus_set()
@@ -2502,7 +2671,7 @@ class App:
         if d["mode"] == "height":
             h = min(max(d["h0"] + e.y - d["y"], TRACK_MIN_H), TRACK_MAX_H)
             self.tracks(d["kind"])[d["i"]]["h"] = h
-            self.draw_timeline()
+            self.draw_timeline_soon()
             return
         if not d["moved"] and abs(e.x - d["x"]) < 3 and abs(e.y - d["y"]) < 3:
             return
@@ -2534,21 +2703,22 @@ class App:
                 image = self.media[o["path"]]["image"]
                 if d["mode"] == "left":
                     hi = min(hi, o["dur"] - MIN_CLIP)
-                    lo = max(lo, -o["start"], -1e9 if image else -o["inp"])
+                    lo = max(lo, -o["start"], -1e9 if image else -o["inp"] / spd(o))
                 else:
                     lo = max(lo, MIN_CLIP - o["dur"])
                     if not image:
-                        hi = min(hi, self.media[o["path"]]["dur"] - o["inp"] - o["dur"])
+                        hi = min(hi, (self.media[o["path"]]["dur"] - o["inp"]) / spd(o) - o["dur"])
             edge = me["start"] if d["mode"] == "left" else me["start"] + me["dur"]
             dt += self.snap_delta((edge + dt,), orig)
             dt = min(max(dt, lo), hi)
             for i in ids:
                 o, c = orig[i], self.by_id(i)
                 if d["mode"] == "left":
-                    c["start"], c["inp"], c["dur"] = o["start"] + dt, o["inp"] + dt, o["dur"] - dt
+                    c["start"], c["inp"], c["dur"] = (o["start"] + dt, o["inp"] + dt * spd(o),
+                                                      o["dur"] - dt)
                 else:
                     c["dur"] = o["dur"] + dt
-        self.draw_timeline()
+        self.draw_timeline_soon()
 
     def on_tl_release(self, e):
         d, self.tdrag = self.tdrag, None
@@ -2630,7 +2800,8 @@ class App:
                     if self.media[c["path"]]["image"]:
                         inputs += ["-loop", "1", "-framerate", str(fps), "-t", f"{e - s:.3f}"]
                     else:
-                        inputs += ["-ss", f"{c['inp'] + s - c['start']:.3f}", "-t", f"{e - s:.3f}"]
+                        inputs += ["-ss", f"{c['inp'] + (s - c['start']) * spd(c):.3f}",
+                                   "-t", f"{(e - s) * spd(c):.3f}"]
                     inputs += ["-i", c["path"]]
                     parts.append(f"[{n}:v]{self.video_chain(c, s, t0, W, H, fps)}[v{n}]")
                     # position is in frame pixels (Y up, like DaVinci); scaled for small previews
@@ -2645,8 +2816,8 @@ class App:
                 if tr["muted"]:
                     continue
                 for c, s, e in spans("a", ti):
-                    inputs += ["-ss", f"{c['inp'] + s - c['start']:.3f}", "-t", f"{e - s:.3f}",
-                               "-i", c["path"]]
+                    inputs += ["-ss", f"{c['inp'] + (s - c['start']) * spd(c):.3f}",
+                               "-t", f"{(e - s) * spd(c):.3f}", "-i", c["path"]]
                     parts.append(f"[{n}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts="
                                  f"stereo,{self.audio_chain(c, s)}apad,atrim=duration={e - s:.3f},"
                                  f"adelay={int(round((s - t0) * 1000))}:all=1[a{n}]")
@@ -2664,6 +2835,8 @@ class App:
         """Filters for one visual clip: crop, flip, fit * zoom, rotate, opacity, fades, timing.
         The rgba path is only taken when a setting needs alpha, to keep playback fast."""
         f = []
+        if abs(spd(c) - 1) > 1e-6:   # speed: file time -> timeline time
+            f.append(f"setpts=(PTS-STARTPTS)/{spd(c):.5f}")
         cl, cr, ct, cb = (cp(c, k) / 100 for k in ("crop_l", "crop_r", "crop_t", "crop_b"))
         if cl or cr or ct or cb:
             f.append(f"crop=w=iw*{max(1 - cl - cr, 0.02):.4f}:h=ih*{max(1 - ct - cb, 0.02):.4f}:"
@@ -2695,8 +2868,8 @@ class App:
         return ",".join(f)
 
     def audio_chain(self, c, s):
-        """Volume, pan and fades for one audio clip ('' or filters ending in a comma)."""
-        f = []
+        """Speed, volume, pan and fades for one audio clip ('' or filters ending in a comma)."""
+        f = speed_filters(c)
         if cp(c, "volume"):
             f.append(f"volume={cp(c, 'volume'):.2f}dB")
         pan = cp(c, "pan")
@@ -2736,7 +2909,7 @@ class App:
 
     def src_key(self, c, t):
         image = self.media[c["path"]]["image"]
-        return c["path"], 0.0 if image else round(c["inp"] + t - c["start"], 3)
+        return c["path"], 0.0 if image else round(c["inp"] + (t - c["start"]) * spd(c), 3)
 
     def live_preview(self):
         """Composites the preview frame in memory from cached source frames, following graph():
@@ -2862,8 +3035,8 @@ class App:
                 elif kind == "dropinfo":
                     if msg[2]:
                         self.remember_media(msg[1], msg[2])
-                    if self.drop:
-                        self.draw_timeline()
+                    if self.drop:   # the ghost clips get their real length
+                        self.draw_drop_layer()
                 elif kind in ("thumbs", "peaks"):
                     (self.thumbs if kind == "thumbs" else self.peaks)[msg[1]] = msg[2]
                     self.draw_timeline()
@@ -3100,8 +3273,6 @@ class App:
             if not m:
                 continue
             self.last_dir = str(Path(path).parent)
-            if self.template_fresh and m["video"] and not m["image"]:
-                self.adopt_frame(m)
             if not self.vw and m["video"]:
                 img = None if m["image"] else grab_frame(path, 0)
                 size = m["size"] if m["image"] else (img.size if img else None)
@@ -3216,36 +3387,42 @@ class App:
         # dragging is normal; refusing it would block the drop. Refuse only non-media files.
         if e.data and not paths:
             return "refuse_drop"
+        # this runs for every mouse move of the drag: only redraw the ghost clips, and only
+        # when where they'd land actually changed
         n = (f"{len(paths)} files" if len(paths) > 1 else Path(paths[0]).name) if paths else "files"
+        old = (self.drop["target"], self.drop["kind"])
         if not timeline or not self.clips:
             self.drop["target"] = None
-            self.status.config(text=f"Drop to add {n} to the end of the timeline")
-            self.draw_timeline()
-            return "copy"
-        x = e.x_root - self.tl.winfo_rootx()
-        y = e.y_root - self.tl.winfo_rooty()
-        rows = self.rows()
-        r = self.row_at(y) or (rows[0] if y < RULER_H else rows[-1])
-        t = max(0.0, self.x2t(max(x, HEAD_W)))
-        total = sum(self.drop_dur(p) for p in paths)
-        t = max(0.0, t + self.snap_delta((t, t + total), ()))
-        self.drop.update(target=(t, r[1]), kind=r[0])
-        self.status.config(text=f"Drop to place {n} at {fmt_time(t)} on V{r[1] + 1} / A{r[1] + 1}")
-        self.draw_timeline()
+            text = f"Drop to add {n} to the end of the timeline"
+        else:
+            x = e.x_root - self.tl.winfo_rootx()
+            y = e.y_root - self.tl.winfo_rooty()
+            rows = self.rows()
+            r = self.row_at(y) or (rows[0] if y < RULER_H else rows[-1])
+            t = max(0.0, self.x2t(max(x, HEAD_W)))
+            total = sum(self.drop_dur(p) for p in paths)
+            t = max(0.0, t + self.snap_delta((t, t + total), ()))
+            t = round(t * self.pps) / self.pps   # whole pixels: no redraw for sub-pixel moves
+            self.drop.update(target=(t, r[1]), kind=r[0])
+            text = f"Drop to place {n} at {fmt_time(t)} on V{r[1] + 1} / A{r[1] + 1}"
+        if self.status.cget("text") != text:
+            self.status.config(text=text)
+        if (self.drop["target"], self.drop["kind"]) != old:
+            self.draw_drop_layer()
         return "copy"
 
     def on_drop_leave(self, e):
         self.drop = None
         self.status.config(text="Ready")
-        self.draw_timeline()
+        self.tl.delete("drop")
 
     def on_drop(self, e):
         timeline = self.over_timeline(e)
         paths = self.drop_paths(e.data)
         target = self.drop and self.drop.get("target") if timeline else None
         self.drop = None
+        self.tl.delete("drop")
         if not paths or self.export_proc:
-            self.draw_timeline()
             return "refuse_drop"
         # add after the drop returns, so Explorer isn't kept waiting while files are read
         self.root.after(10, lambda: self.add_media(paths, drop=target))
@@ -3644,7 +3821,6 @@ class App:
         self.undo_stack.clear()
         self.redo_stack.clear()
         self.project_path = None
-        self.template_fresh = False
         self.after_edit()
         self.redraw()
         self.saved_key = self.state_key()
@@ -3776,13 +3952,18 @@ class App:
     def new_project(self):
         ProjectPicker(self)
 
-    def start_project(self, template):
-        """From the New project picker: None = blank, else a template folder."""
+    def start_project(self, template, size=None):
+        """From the Projects window: None = blank, else a template folder; size = the project's
+        resolution, which stays whatever is added (other sizes are fit into it)."""
         if not self.confirm_discard():
             return
         if template is None:
             self.reset_project()
-            self.status.config(text="New project")
+            if size:
+                self.set_frame(size)
+                self.saved_key = self.state_key()
+            self.status.config(text=f"New project   ·   {self.vw}x{self.vh}" if self.vw
+                               else "New project")
             return
         try:
             data = json.loads((template / ("template" + PROJECT_EXT)).read_text(encoding="utf-8"))
@@ -3790,7 +3971,9 @@ class App:
             messagebox.showerror("New project", "That template could not be read.")
             return
         self.load_project_data(data, template)
-        self.template_fresh = True
+        if size:
+            self.set_frame(size)
+            self.undo_stack.clear()
         if data.get("export"):
             self.exp_settings = dict(data["export"])
         self.project_path = None
@@ -3860,13 +4043,17 @@ class App:
         if img:
             img.save(out)
 
-    def adopt_frame(self, m):
-        """In a project started from a template, the first video you add sets the frame size
-        (so it isn't scaled down to the template's), and the template's layout scales along:
-        positions and the crop box. Zoom is relative to the frame already."""
-        self.template_fresh = False
-        size = m.get("size")
-        if not size or not self.vw or tuple(size) == (self.vw, self.vh):
+    def set_frame(self, size):
+        """Sets the project's resolution. Clip positions and the crop box scale along, so a
+        layout (like a template's logo in the corner) stays in place; zoom is relative to the
+        frame already."""
+        size = tuple(size)
+        if not self.vw:
+            self.vw, self.vh = size
+            self.crop = [0.0, 0.0, float(self.vw), float(self.vh)]
+            self.apply_ratio()
+            return
+        if size == (self.vw, self.vh):
             return
         sx, sy = size[0] / self.vw, size[1] / self.vh
         for c in self.clips:
@@ -3875,10 +4062,27 @@ class App:
                     c[key] = float(round(cp(c, key) * f))
         x, y, w, h = self.crop
         self.vw, self.vh = size
-        self.pfps = m["fps"]
+        full = (abs(x) < 1 and abs(y) < 1 and abs(w * sx - self.vw) < 2 and abs(h * sy - self.vh) < 2)
         self.crop = [x * sx, y * sy, w * sx, h * sy]
+        if full:
+            self.crop = [0.0, 0.0, float(self.vw), float(self.vh)]
         if self.get_ratio() and abs(sx - sy) > 1e-3:   # a new shape: re-fit the locked crop
             self.apply_ratio()
+        self.frame = None
+        self.src_cache.clear()
+        self.redraw()
+
+    def change_resolution(self):
+        """Timeline > Project resolution."""
+        size = ask_resolution(self.root, f"{self.vw}x{self.vh}" if self.vw else RESOLUTIONS[0])
+        if not size or size == (self.vw, self.vh):
+            return
+        before = self.snapshot()
+        self.set_frame(size)
+        self.settings["frame"] = list(size)
+        save_settings(self.settings)
+        self.commit(before)
+        self.status.config(text=f"Project resolution {self.vw}x{self.vh}")
 
     def apply_fills(self):
         """Template clips marked "fill" stretch to the end of everything else (an image to any
@@ -3891,7 +4095,7 @@ class App:
             m = self.media[c["path"]]
             dur = end - c["start"]
             if not m["image"]:
-                dur = min(dur, m["dur"] - c["inp"])
+                dur = min(dur, (m["dur"] - c["inp"]) / spd(c))
             if dur >= MIN_CLIP:
                 c["dur"] = dur
 
