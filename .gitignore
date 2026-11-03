@@ -13,6 +13,7 @@ CLAUDE.md
 packaging/.venv/
 packaging/ffmpeg_dl/
 packaging/whisper_dl/
+packaging/vulkan_dl/
 packaging/build/
 packaging/dist/
 packaging/Output/

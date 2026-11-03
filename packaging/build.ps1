@@ -8,6 +8,8 @@
 #   FFmpeg shared build unzipped into packaging\ffmpeg_dl (from github.com/BtbN/FFmpeg-Builds)
 #   whisper.cpp whisper-bin-x64.zip unzipped into packaging\whisper_dl\bin (from
 #   github.com/ggml-org/whisper.cpp releases; only whisper-cli + its DLLs are installed)
+#   GPU captions: ggml-vulkan.dll from llama.cpp's llama-b11446-bin-win-vulkan-x64.zip (same day
+#   and ggml as whisper.cpp b5454) copied into packaging\whisper_dl\bin\Release
 # not "Stop": PyInstaller logs to stderr, which PowerShell 5.1 would treat as an error.
 # Failures are caught with $LASTEXITCODE checks below.
 $ErrorActionPreference = "Continue"
@@ -20,6 +22,7 @@ $ffmpeg = Get-ChildItem "$here\ffmpeg_dl" -Directory | Where-Object { Test-Path 
 if (-not $ffmpeg) { throw "No FFmpeg build found in packaging\ffmpeg_dl" }
 $whisper = "$here\whisper_dl\bin\Release"
 if (-not (Test-Path "$whisper\whisper-cli.exe")) { throw "No whisper-cli.exe in packaging\whisper_dl\bin\Release" }
+if (-not (Test-Path "$whisper\ggml-vulkan.dll")) { Write-Warning "No ggml-vulkan.dll: captions will run on the CPU only" }
 $iscc = @("$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe", "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe") |
     Where-Object { Test-Path $_ } | Select-Object -First 1
 if (-not $iscc) { throw "Inno Setup not found (winget install JRSoftware.InnoSetup)" }

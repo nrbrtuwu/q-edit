@@ -75,7 +75,7 @@ IMAGE_DUR = 5.0
 MIN_CLIP = 0.05
 MEDIA_TYPES = [("Media", "*.mp4 *.mov *.mkv *.avi *.webm *.m4v *.mp3 *.wav *.m4a *.aac *.flac "
                          "*.ogg *.png *.jpg *.jpeg *.bmp *.webp"), ("All files", "*.*")]
-APP_VERSION = "1.9.0"
+APP_VERSION = "1.10.0"
 FROZEN = getattr(sys, "frozen", False)  # True when running from the installed .exe
 APP_DIR = Path(sys.executable).parent if FROZEN else Path(__file__).parent
 DATA_DIR = Path(getattr(sys, "_MEIPASS", APP_DIR))
@@ -97,6 +97,8 @@ CAPTION_LANGS = {"English": "en", "Hungarian": "hu", "Detect automatically": "au
 CAPTION_LENGTHS = {"Short (a few words, TikTok style)": 18, "Long (up to two lines)": 42}
 FONTS_DIR = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
 CAPTION_FONTS = ["segoeuib.ttf", "arialbd.ttf"]   # Segoe UI Bold, Arial Bold as a fallback
+HL_COLORS = {"Yellow": "#FFE000", "Green": "#3CFF6A", "Cyan": "#3CDCFF", "Pink": "#FF50D2",
+             "Orange": "#FF9A1E", "Red": "#FF3C3C"}   # the spoken word in a caption
 
 
 def migrate_settings_dir():
@@ -145,7 +147,7 @@ TRACK_MIN_H, TRACK_MAX_H = 24, 160
 CLIP_DEFAULTS = {"zoom": 1.0, "pos_x": 0.0, "pos_y": 0.0, "rotation": 0.0, "flip_h": False,
                  "flip_v": False, "crop_l": 0.0, "crop_r": 0.0, "crop_t": 0.0, "crop_b": 0.0,
                  "opacity": 100.0, "fade_in": 0.0, "fade_out": 0.0, "volume": 0.0, "pan": 0.0,
-                 "speed": 100.0, "keep_pitch": True}
+                 "speed": 100.0, "keep_pitch": True, "highlight": True, "hl_color": "Yellow"}
 THUMB_H = 72          # height thumbnails are extracted at
 PEAKS_PER_SEC = 100   # waveform resolution
 # glyphs from Segoe Fluent Icons / Segoe MDL2 Assets (built into Windows 10/11)
@@ -453,9 +455,9 @@ def caption_lines(text, vw, vh):
     return out or [""]
 
 
-def caption_image(text, vw, vh, scale):
+def caption_image(text, vw, vh, scale, active=None, color="#FFE000"):
     """The caption drawn like the export draws it (white, black outline, centered lines), at
-    `scale` times frame pixels, as RGBA."""
+    `scale` times frame pixels, as RGBA. active = index of the word drawn in `color`."""
     fs, bord = caption_style(vw, vh)
     font = caption_font(fs * scale)
     lines = caption_lines(text, vw, vh)
@@ -465,10 +467,47 @@ def caption_image(text, vw, vh, scale):
     im = Image.new("RGBA", (max(W, 2), max(H, 2)), (0, 0, 0, 0))
     d = ImageDraw.Draw(im)
     top = b + (lh - sum(font.getmetrics())) / 2
+    n = 0   # words before this line
     for i, (t, w) in enumerate(zip(lines, widths)):
-        d.text(((W - w) / 2, top + i * lh), t, font=font, fill="white", stroke_width=b,
-               stroke_fill="black")
+        x, y = (W - w) / 2, top + i * lh
+        d.text((x, y), t, font=font, fill="white", stroke_width=b, stroke_fill="black")
+        words = t.split(" ")
+        if active is not None and n <= active < n + len(words):
+            j = active - n
+            pre = " ".join(words[:j]) + (" " if j else "")
+            d.text((x + font.getlength(pre), y), words[j], font=font, fill=color,
+                   stroke_width=b, stroke_fill="black")
+        n += len(words)
     return im
+
+
+def caption_words(c):
+    """[(start, end, word)] of a caption in its own time (inp-based, so trims and splits keep
+    them in place). The words recognized with the caption, or, once its text was edited into a
+    different number of words, the text spread evenly over the clip."""
+    words = c["caption"].split()
+    timed = c.get("words") or []
+    if len(timed) == len(words):
+        return [(a, b, w) for (a, b, _), w in zip(timed, words)]
+    n = max(len(words), 1)
+    a0, d = c["inp"], c["dur"]
+    return [(a0 + d * i / n, a0 + d * (i + 1) / n, w) for i, w in enumerate(words)]
+
+
+def active_word(c, t):
+    """Index of the word being said at timeline time t (the last one that has started)."""
+    local = c["inp"] + (t - c["start"])
+    idx = None
+    for i, (a, _, _) in enumerate(caption_words(c)):
+        if a <= local + 1e-6:
+            idx = i
+    return idx
+
+
+def ass_color(hexcolor):
+    """'#RRGGBB' -> ASS '&HBBGGRR&'."""
+    h = hexcolor.lstrip("#")
+    return f"&H{h[4:6]}{h[2:4]}{h[0:2]}&".upper()
 
 
 def ass_time(t):
@@ -482,13 +521,13 @@ def ff_path(path):
 
 
 def group_words(words, max_chars):
-    """Timed words -> captions [(start, end, text)]: a caption ends at a sentence end, a pause,
-    or when it would get longer than max_chars."""
+    """Timed words -> captions [(start, end, text, words)]: a caption ends at a sentence end, a
+    pause, or when it would get longer than max_chars."""
     caps, cur = [], []
 
     def flush():
         if cur:
-            caps.append([cur[0][0], cur[-1][1], " ".join(w for _, _, w in cur)])
+            caps.append([cur[0][0], cur[-1][1], " ".join(w for _, _, w in cur), list(cur)])
             cur.clear()
     for a, b, w in words:
         if cur:
@@ -1706,6 +1745,7 @@ class App:
         self.status.pack(side="left", padx=10)
         self.cap_proc = None   # None = idle, False = starting, a Popen while whisper runs
         self.cap_cancel = False
+        self.cap_gpu = None    # False once the GPU failed this session (then only the CPU)
         # preview above, timeline below; drag the bar between them to resize
         self.paned = tk.PanedWindow(self.root, orient="vertical", bg=BG, bd=0, sashwidth=6,
                                     sashrelief="flat", sashcursor="sb_v_double_arrow",
@@ -2231,6 +2271,21 @@ class App:
                               style="PanelMuted.TLabel", font=SMALL_FONT).grid(
                         row=r, column=0, columnspan=4, sticky="w")
                     r += 1
+                    hl = ttk.Frame(body, style="Panel.TFrame")
+                    hl.grid(row=r, column=0, columnspan=4, sticky="w", pady=(6, 0))
+                    var = tk.BooleanVar(value=True)
+                    ttk.Checkbutton(hl, text="Highlight the spoken word", variable=var,
+                                    style="Panel.TCheckbutton", takefocus=False,
+                                    command=lambda v=var: (self.insp_set("c", "highlight", v.get()),
+                                                           self.insp_end())).pack(side="left")
+                    self.fields[("c", "highlight")] = var
+                    self.hl_var = tk.StringVar(value="Yellow")
+                    box = ttk.Combobox(hl, textvariable=self.hl_var, values=list(HL_COLORS),
+                                       state="readonly", width=8)
+                    box.pack(side="left", padx=(10, 0))
+                    box.bind("<<ComboboxSelected>>", lambda e: (
+                        self.insp_set("c", "hl_color", self.hl_var.get()), self.insp_end()))
+                    r += 1
                 for key, label, lo, hi, step, fmt, slider in rows:
                     self.fields[(kind, key)] = SlideField(
                         body, r, label, lo, hi, step, fmt, CLIP_DEFAULTS[key],
@@ -2350,6 +2405,8 @@ class App:
             if key in ("fade_in", "fade_out"):
                 f.hi = max(0.1, min(10.0, c["dur"]))
             f.show(cp(c, key))
+        if self.insp_kind == "c":
+            self.hl_var.set(cp(c, "hl_color"))
         if self.insp_kind == "c" and self.root.focus_get() is not self.cap_text:
             if self.cap_text.get("1.0", "end-1c") != c["caption"]:
                 self.cap_text.delete("1.0", "end")
@@ -2469,6 +2526,7 @@ class App:
             return
         before = self.snapshot()
         keys = {k for _, rows in self.INSPECTOR[kind] for k, *_ in rows} | {"keep_pitch"}
+        keys |= {"highlight", "hl_color"} if kind == "c" else set()
         keys |= {"flip_h", "flip_v"} if kind == "v" else set()
         ids = {i for c in clips for i in self.linked(c)}
         self.set_speed([c for c in self.clips if c["id"] in ids], 100.0)   # back to full length
@@ -3144,21 +3202,41 @@ class App:
         for c, s, e in caps:
             x, y = self.vw / 2 + cp(c, "pos_x"), self.vh / 2 - cp(c, "pos_y")
             z = cp(c, "zoom") * 100
-            tags = f"\\an5\\pos({x:.1f},{y:.1f})\\fscx{z:.1f}\\fscy{z:.1f}"
+            base = f"\\an5\\pos({x:.1f},{y:.1f})\\fscx{z:.1f}\\fscy{z:.1f}"
             if cp(c, "rotation"):
-                tags += f"\\frz{-cp(c, 'rotation'):.2f}"   # libass turns counterclockwise
+                base += f"\\frz{-cp(c, 'rotation'):.2f}"   # libass turns counterclockwise
             if cp(c, "opacity") < 100:
-                tags += f"\\alpha&H{round(255 * (1 - cp(c, 'opacity') / 100)):02X}&"
+                base += f"\\alpha&H{round(255 * (1 - cp(c, 'opacity') / 100)):02X}&"
             fi, fo = cp(c, "fade_in"), cp(c, "fade_out")
-            if fi or fo:   # times from this event's start, which may be inside the clip
-                t1 = -round((s - c["start"]) * 1000)
-                d = round(c["dur"] * 1000)
-                tags += (f"\\fade(255,0,255,{t1},{t1 + round(fi * 1000)},"
-                         f"{t1 + d - round(fo * 1000)},{t1 + d})")
-            text = "\\N".join(caption_lines(c["caption"], self.vw, self.vh))
-            text = text.replace("{", "(").replace("}", ")")
-            lines.append(f"Dialogue: 0,{ass_time(s - t0)},{ass_time(e - t0)},Cap,,0,0,0,,"
-                         f"{{{tags}}}{text}")
+            rows = [[w.replace("{", "(").replace("}", ")") for w in line.split(" ")]
+                    for line in caption_lines(c["caption"], self.vw, self.vh)]
+            # spoken-word highlight: one event per word, from its start to the next one's
+            spans = [(s, e, None)]
+            if cp(c, "highlight"):
+                cuts = [c["start"] + a - c["inp"] for a, _, _ in caption_words(c)]
+                spans, prev = [], s
+                for i, a in enumerate(cuts + [e]):
+                    a = min(max(a, s), e)
+                    if a > prev + 1e-3:   # a cut before s just moves the active word on
+                        spans.append((prev, a, i - 1 if i else None))
+                        prev = a
+            hl = ass_color(HL_COLORS.get(cp(c, "hl_color"), HL_COLORS["Yellow"]))
+            for a, b, active in spans:
+                tags = base
+                if fi or fo:   # times from this event's start, which may be inside the clip
+                    t1 = -round((a - c["start"]) * 1000)
+                    d = round(c["dur"] * 1000)
+                    tags += (f"\\fade(255,0,255,{t1},{t1 + round(fi * 1000)},"
+                             f"{t1 + d - round(fo * 1000)},{t1 + d})")
+                out, n = [], 0
+                for row in rows:
+                    words = []
+                    for w in row:
+                        words.append(f"{{\\c{hl}}}{w}{{\\c&HFFFFFF&}}" if n == active else w)
+                        n += 1
+                    out.append(" ".join(words))
+                lines.append(f"Dialogue: 0,{ass_time(a - t0)},{ass_time(b - t0)},Cap,,0,0,0,,"
+                             f"{{{tags}}}" + "\\N".join(out))
         data = ("[Script Info]\nScriptType: v4.00+\n"
                 f"PlayResX: {self.vw}\nPlayResY: {self.vh}\nWrapStyle: 2\n"
                 "ScaledBorderAndShadow: yes\n\n[V4+ Styles]\n"
@@ -3282,7 +3360,9 @@ class App:
         k = W / max(self.vw, 1)
         for c in layers:
             if "caption" in c:   # drawn with the export's font, size and outline
-                im = caption_image(c["caption"], self.vw, self.vh, k * cp(c, "zoom"))
+                im = caption_image(c["caption"], self.vw, self.vh, k * cp(c, "zoom"),
+                                   active_word(c, t) if cp(c, "highlight") else None,
+                                   HL_COLORS.get(cp(c, "hl_color"), HL_COLORS["Yellow"]))
             else:
                 im = self.src_cache[self.src_key(c, t)]
                 cl, cr, ct, cb = (cp(c, x) / 100 for x in ("crop_l", "crop_r", "crop_t", "crop_b"))
@@ -4130,23 +4210,37 @@ class App:
                     os.remove(out.with_suffix(".json"))
                 except OSError:
                     pass
-                self.cap_proc = subprocess.Popen(
-                    [whisper_exe(), "-m", str(path), "-f", str(wav), "-l", lang, "-oj",
-                     "-of", str(out), "-ml", "1", "-sow", "-np", "-pp",
-                     "-t", str(max(2, (os.cpu_count() or 4) - 2))],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
-                    creationflags=BGWIN, text=True, errors="replace")
-                tail = []
-                for line in self.cap_proc.stderr:
-                    m = re.search(r"progress\s*=\s*(\d+)%", line)
-                    if m:
-                        say(f"Captions {n + 1}/{len(jobs)}: listening to {name}...  {m.group(1)}%",
-                            int(m.group(1)) / 100)
-                    else:
-                        tail = (tail + [line.strip()])[-4:]
-                rc = self.cap_proc.wait()
-                if self.cap_cancel:
-                    raise InterruptedError
+                # GPU first (the Vulkan backend next to whisper-cli: AMD, NVIDIA, Intel); if
+                # that fails (old driver, no GPU memory) the same run goes again on the CPU
+                for gpu in ([True, False] if self.cap_gpu is not False else [False]):
+                    where = "GPU" if gpu else "CPU"
+                    self.cap_proc = subprocess.Popen(
+                        [whisper_exe(), "-m", str(path), "-f", str(wav), "-l", lang, "-oj",
+                         "-of", str(out), "-ml", "1", "-sow", "-pp",
+                         "-t", str(max(2, (os.cpu_count() or 4) - 2))] + ([] if gpu else ["-ng"]),
+                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                        stdin=subprocess.DEVNULL, creationflags=BGWIN, text=True,
+                        errors="replace")
+                    tail, dev = [], ""
+                    for line in self.cap_proc.stderr:
+                        if "ggml_vulkan: 0 = " in line:   # the card's name
+                            dev = line.split("= ", 1)[1].split(" (")[0].split(" |")[0].strip()
+                        if gpu and "whisper_backend_init_gpu: using" in line:
+                            where = f"GPU ({dev})" if dev else "GPU"
+                        m = re.search(r"progress\s*=\s*(\d+)%", line)
+                        if m:
+                            say(f"Captions {n + 1}/{len(jobs)}: listening to {name} on the "
+                                f"{where}...  {m.group(1)}%", int(m.group(1)) / 100)
+                        elif line.strip():
+                            tail = (tail + [line.strip()])[-4:]
+                    rc = self.cap_proc.wait()
+                    if self.cap_cancel:
+                        raise InterruptedError
+                    if not rc:
+                        self.cap_gpu = gpu and where.startswith("GPU")
+                        break
+                    if gpu:
+                        say(f"Captions {n + 1}/{len(jobs)}: the GPU failed, using the CPU...", 0)
                 if rc:
                     raise OSError("whisper failed: " + " ".join(tail)[-300:])
                 data = json.loads(out.with_suffix(".json").read_text(encoding="utf-8",
@@ -4159,7 +4253,8 @@ class App:
                     a, b = seg["offsets"]["from"] / 1000, seg["offsets"]["to"] / 1000
                     words.append((c["start"] + a / k, c["start"] + b / k, w))
                 end = c["start"] + c["dur"]
-                caps = [(a, min(b, end), t) for a, b, t in group_words(words, max_chars) if a < end]
+                caps = [(a, min(b, end), t, ws) for a, b, t, ws in group_words(words, max_chars)
+                        if a < end]
                 self.q.put(("capclips", c, caps))
             self.q.put(("capdone", True, ""))
         except InterruptedError:
@@ -4193,10 +4288,11 @@ class App:
         self.vtracks.append({"hidden": False})
         track = len(self.vtracks) - 1
         new = []
-        for a, b, text in caps:
+        for a, b, text, ws in caps:
             c = {"id": self.new_id(), "kind": "v", "track": track, "path": path, "start": a,
                  "inp": 0.0, "dur": max(b - a, MIN_CLIP), "link": None, "caption": text,
-                 "pos_y": float(-round(self.vh * 0.27))}
+                 "pos_y": float(-round(self.vh * 0.27)),
+                 "words": [[round(wa - a, 3), round(wb - a, 3), w] for wa, wb, w in ws]}
             new.append(c)
         self.clips += new
         self.sel = {c["id"] for c in new}
