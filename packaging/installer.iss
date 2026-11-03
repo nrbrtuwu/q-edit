@@ -33,6 +33,11 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Source: "dist\{#AppName}\*"; DestDir: "{app}"; Flags: recursesubdirs ignoreversion
 Source: "{#FFmpegDir}\bin\*"; DestDir: "{app}\ffmpeg"; Flags: ignoreversion
 Source: "{#FFmpegDir}\LICENSE.txt"; DestDir: "{app}\ffmpeg"; DestName: "FFmpeg-LICENSE.txt"
+; whisper.cpp (auto captions); the speech model is downloaded by the app on first use
+Source: "{#WhisperDir}\whisper-cli.exe"; DestDir: "{app}\whisper"; Flags: ignoreversion
+Source: "{#WhisperDir}\whisper.dll"; DestDir: "{app}\whisper"; Flags: ignoreversion
+Source: "{#WhisperDir}\ggml*.dll"; DestDir: "{app}\whisper"; Flags: ignoreversion
+Source: "whisper-LICENSE.txt"; DestDir: "{app}\whisper"
 
 ; before 1.1.1 the app was called "Clip Editor"; same AppId, so an upgrade lands here
 [InstallDelete]

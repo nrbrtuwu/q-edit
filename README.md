@@ -10,6 +10,9 @@ inspector.
 - Drag and drop videos, images, audio files or whole folders from Explorer
 - Inspector for each clip: zoom, position, rotation, flip, cropping, opacity, fades, volume, pan,
   speed (10-400%, with or without pitch correction); move and scale clips right on the preview
+- Auto captions (English, Hungarian or auto-detect) with [whisper.cpp](https://github.com/ggml-org/whisper.cpp),
+  offline: right-click a clip or use the inspector; captions are editable clips on their own track.
+  The speech model (Fast 190 MB or Accurate 574 MB) downloads on first use
 - Projects (`.qedit`) with a fixed resolution you pick (any size, e.g. 1080x1920), save, open and
   recent files; reusable templates, like a logo already
   placed on V2 that stretches to whatever video you drop in
@@ -36,4 +39,8 @@ See the comments at the top of [packaging/build.ps1](packaging/build.ps1). It bu
 ## Third-party software
 
 The installer bundles [FFmpeg](https://ffmpeg.org) (GPL build from
-[BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds)); its license is installed alongside it.
+[BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds)) and
+[whisper.cpp](https://github.com/ggml-org/whisper.cpp)'s whisper-cli (MIT); their licenses are installed
+alongside them. Speech models come from [ggerganov/whisper.cpp](https://huggingface.co/ggerganov/whisper.cpp)
+on Hugging Face. When running from source, put whisper-cli.exe on PATH (or unzip whisper-bin-x64.zip into
+`packaging/whisper_dl/bin`) for auto captions.

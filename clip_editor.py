@@ -25,6 +25,7 @@ Shortcuts:
 
 import copy
 from array import array
+import hashlib
 import json
 import math
 import os
@@ -36,6 +37,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+import urllib.request
 import tkinter.font as tkfont
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
@@ -43,7 +45,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 try:
-    from PIL import Image, ImageTk
+    from PIL import Image, ImageDraw, ImageFont, ImageTk
 except ImportError:
     print("Pillow is missing. Install it with:  pip install pillow")
     sys.exit(1)
@@ -73,7 +75,7 @@ IMAGE_DUR = 5.0
 MIN_CLIP = 0.05
 MEDIA_TYPES = [("Media", "*.mp4 *.mov *.mkv *.avi *.webm *.m4v *.mp3 *.wav *.m4a *.aac *.flac "
                          "*.ogg *.png *.jpg *.jpeg *.bmp *.webp"), ("All files", "*.*")]
-APP_VERSION = "1.8.1"
+APP_VERSION = "1.9.0"
 FROZEN = getattr(sys, "frozen", False)  # True when running from the installed .exe
 APP_DIR = Path(sys.executable).parent if FROZEN else Path(__file__).parent
 DATA_DIR = Path(getattr(sys, "_MEIPASS", APP_DIR))
@@ -84,6 +86,17 @@ SETTINGS_FILE = (Path(os.environ.get("APPDATA", Path.home())) / "q-edit" / "sett
 PROJECT_EXT = ".qedit"
 PROJECT_TYPES = [("q-edit project", "*.qedit")]
 TEMPLATES_DIR = SETTINGS_FILE.parent / "templates"   # one folder per template, media copied in
+# auto captions: whisper.cpp's whisper-cli turns speech into timed words; the speech model is
+# downloaded the first time (shared by the script and the installed app, as it is large)
+USER_DIR = Path(os.environ.get("APPDATA", Path.home())) / "q-edit"
+MODELS_DIR = USER_DIR / "models"
+CACHE_DIR = USER_DIR / "cache"   # caption .ass files, the caption font, the clips' audio for whisper
+MODEL_URL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/"
+WHISPER_MODELS = {"Fast": ("ggml-small-q5_1.bin", 190), "Accurate": ("ggml-large-v3-turbo-q5_0.bin", 574)}
+CAPTION_LANGS = {"English": "en", "Hungarian": "hu", "Detect automatically": "auto"}
+CAPTION_LENGTHS = {"Short (a few words, TikTok style)": 18, "Long (up to two lines)": 42}
+FONTS_DIR = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
+CAPTION_FONTS = ["segoeuib.ttf", "arialbd.ttf"]   # Segoe UI Bold, Arial Bold as a fallback
 
 
 def migrate_settings_dir():
@@ -125,6 +138,7 @@ HEAD_W, RULER_H, VT_H, AT_H = 116, 24, 58, 44
 EDGE, SNAP_PX = 6, 8
 LANE, HEAD_BG, PLAYHEAD = "#1a1a20", "#25252d", "#ff4d4d"
 CLIP_V, CLIP_V_D, CLIP_A, CLIP_A_D = "#3b5f8f", "#2a4468", "#2f7a55", "#1f553b"
+CLIP_C, CLIP_C_D = "#9a6a2a", "#6e4b1c"   # captions
 TICKS = [0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 1800]
 TRACK_MIN_H, TRACK_MAX_H = 24, 160
 # per-clip settings edited in the inspector; stored flat on the clip dict, missing = default
@@ -378,6 +392,116 @@ def run_bmp(cmd):
     if not out:
         return None
     return Image.open(BytesIO(out)).convert("RGB")
+
+
+def whisper_exe():
+    """whisper-cli: next to the installed app, from packaging/whisper_dl when running the
+    script, or on PATH."""
+    for p in (APP_DIR / "whisper" / "whisper-cli.exe",
+              APP_DIR / "packaging" / "whisper_dl" / "bin" / "Release" / "whisper-cli.exe"):
+        if p.exists():
+            return str(p)
+    return shutil.which("whisper-cli")
+
+
+_cap_fonts = {}
+
+
+def caption_font_file():
+    return next((FONTS_DIR / f for f in CAPTION_FONTS if (FONTS_DIR / f).exists()), None)
+
+
+def caption_font(size):
+    """The caption font at a libass font size: libass sizes a font by its line height (ascent
+    + descent), PIL by its em, so the PIL size is converted to make both draw the same text."""
+    size = max(4, int(round(size)))
+    if size not in _cap_fonts:
+        path = caption_font_file()
+        if path is None:
+            _cap_fonts[size] = ImageFont.load_default()
+        else:
+            probe_font = ImageFont.truetype(str(path), 1000)
+            a, d = probe_font.getmetrics()
+            _cap_fonts[size] = ImageFont.truetype(str(path), max(4, round(size * 1000 / (a + d))))
+        if len(_cap_fonts) > 64:
+            _cap_fonts.clear()
+    return _cap_fonts.setdefault(size, ImageFont.load_default())
+
+
+def caption_style(vw, vh):
+    """(font size, outline) of captions in frame pixels: about 8.5% of the short side."""
+    fs = max(12, round(min(vw, vh) * 0.085))
+    return fs, max(1, round(fs * 0.09))
+
+
+def caption_lines(text, vw, vh):
+    """Wraps a caption to 88% of the frame width (explicit line breaks are kept). Done here, not
+    by libass, so the preview's own drawing breaks the lines at the same words."""
+    fs, _ = caption_style(vw, vh)
+    font, out = caption_font(fs), []
+    for para in text.split("\n"):
+        line = ""
+        for word in para.split():
+            test = f"{line} {word}".strip()
+            if line and font.getlength(test) > vw * 0.88:
+                out.append(line)
+                line = word
+            else:
+                line = test
+        if line:
+            out.append(line)
+    return out or [""]
+
+
+def caption_image(text, vw, vh, scale):
+    """The caption drawn like the export draws it (white, black outline, centered lines), at
+    `scale` times frame pixels, as RGBA."""
+    fs, bord = caption_style(vw, vh)
+    font = caption_font(fs * scale)
+    lines = caption_lines(text, vw, vh)
+    lh, b = max(1, round(fs * scale)), max(1, round(bord * scale))
+    widths = [font.getlength(t) for t in lines]
+    W, H = int(max(widths) + 2 * b + 2), int(lh * len(lines) + 2 * b)
+    im = Image.new("RGBA", (max(W, 2), max(H, 2)), (0, 0, 0, 0))
+    d = ImageDraw.Draw(im)
+    top = b + (lh - sum(font.getmetrics())) / 2
+    for i, (t, w) in enumerate(zip(lines, widths)):
+        d.text(((W - w) / 2, top + i * lh), t, font=font, fill="white", stroke_width=b,
+               stroke_fill="black")
+    return im
+
+
+def ass_time(t):
+    cs = max(0, int(round(t * 100)))
+    return f"{cs // 360000}:{cs // 6000 % 60:02d}:{cs // 100 % 60:02d}.{cs % 100:02d}"
+
+
+def ff_path(path):
+    """A path inside a filtergraph option ('C\\:/dir/file')."""
+    return str(path).replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
+
+
+def group_words(words, max_chars):
+    """Timed words -> captions [(start, end, text)]: a caption ends at a sentence end, a pause,
+    or when it would get longer than max_chars."""
+    caps, cur = [], []
+
+    def flush():
+        if cur:
+            caps.append([cur[0][0], cur[-1][1], " ".join(w for _, _, w in cur)])
+            cur.clear()
+    for a, b, w in words:
+        if cur:
+            text = " ".join(x for _, _, x in cur)
+            if (len(text) + 1 + len(w) > max_chars or a - cur[-1][1] > 0.7
+                    or text[-1] in ".?!" or b - cur[0][0] > (3.0 if max_chars < 30 else 6.0)):
+                flush()
+        cur.append((a, b, w))
+    flush()
+    for i, c in enumerate(caps):   # stay up a moment after the last word, but not into the next
+        nxt = caps[i + 1][0] if i + 1 < len(caps) else c[1] + 0.4
+        c[1] = max(min(c[1] + 0.3, nxt), min(c[0] + 0.4, nxt))
+    return [tuple(c) for c in caps if c[1] - c[0] >= 0.05 and c[2].strip()]
 
 
 def spd(c):
@@ -1114,6 +1238,68 @@ class ProjectPicker(tk.Toplevel):
             self.app.open_any()
 
 
+class CaptionDialog(tk.Toplevel):
+    """Auto captions: language, model (Fast / Accurate) and caption length."""
+
+    def __init__(self, app, clips):
+        super().__init__(app.root)
+        self.app, self.clips = app, clips
+        self.title("Auto captions")
+        self.configure(bg=BG)
+        self.transient(app.root)
+        self.resizable(False, False)
+        prev = app.settings.get("captions", {})
+        body = ttk.Frame(self, padding=(18, 16, 18, 14))
+        body.pack(fill="both", expand=True)
+        names = sorted({Path(c["path"]).name for c in clips})
+        ttk.Label(body, text="Auto captions", style="Head.TLabel").grid(row=0, column=0,
+                                                                       columnspan=2, sticky="w")
+        ttk.Label(body, text=", ".join(names)[:70], style="Muted.TLabel").grid(
+            row=1, column=0, columnspan=2, sticky="w", pady=(0, 10))
+        self.lang = tk.StringVar(value=prev.get("lang", "English"))
+        self.model = tk.StringVar(value=prev.get("model", "Accurate"))
+        self.length = tk.StringVar(value=prev.get("length", next(iter(CAPTION_LENGTHS))))
+        ttk.Label(body, text="Language").grid(row=2, column=0, sticky="w", padx=(0, 14), pady=4)
+        ttk.Combobox(body, textvariable=self.lang, values=list(CAPTION_LANGS), state="readonly",
+                     width=34).grid(row=2, column=1, sticky="w")
+        ttk.Label(body, text="Caption length").grid(row=3, column=0, sticky="w", padx=(0, 14), pady=4)
+        ttk.Combobox(body, textvariable=self.length, values=list(CAPTION_LENGTHS),
+                     state="readonly", width=34).grid(row=3, column=1, sticky="w")
+        ttk.Label(body, text="Speech model").grid(row=4, column=0, sticky="nw", padx=(0, 14), pady=4)
+        models = ttk.Frame(body)
+        models.grid(row=4, column=1, sticky="w", pady=4)
+        for name, desc in (("Accurate", "best for Hungarian, slower"), ("Fast", "quick, best for clear English")):
+            file, mb = WHISPER_MODELS[name]
+            have = (MODELS_DIR / file).exists()
+            ttk.Radiobutton(models, text=f"{name}: {desc}", value=name, variable=self.model,
+                            takefocus=False).pack(anchor="w")
+            ttk.Label(models, text=("downloaded" if have else f"downloads {mb} MB once"),
+                      style="Muted.TLabel").pack(anchor="w", padx=(22, 0), pady=(0, 4))
+        ttk.Label(body, text="Captions go on a new video track at the top. Click one to fix "
+                             "its text, move or size it in the inspector.", style="Muted.TLabel",
+                  wraplength=420, justify="left").grid(row=5, column=0, columnspan=2, sticky="w",
+                                                       pady=(8, 0))
+        btns = ttk.Frame(body)
+        btns.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(14, 0))
+        ttk.Button(btns, text="Create captions", style="Accent.TButton", command=self.ok,
+                   takefocus=False).pack(side="right")
+        ttk.Button(btns, text="Cancel", command=self.destroy, takefocus=False).pack(side="right",
+                                                                                   padx=(0, 8))
+        self.bind("<Return>", lambda e: self.ok())
+        self.bind("<Escape>", lambda e: self.destroy())
+        dark_titlebar(self)
+        center_on(self, app.root)
+        self.grab_set()
+
+    def ok(self):
+        choice = {"lang": self.lang.get(), "model": self.model.get(), "length": self.length.get()}
+        self.app.settings["captions"] = choice
+        save_settings(self.app.settings)
+        self.destroy()
+        self.app.start_captions(self.clips, CAPTION_LANGS[choice["lang"]],
+                                WHISPER_MODELS[choice["model"]][0], CAPTION_LENGTHS[choice["length"]])
+
+
 def ask_resolution(parent, initial):
     """Small dialog: a resolution from RESOLUTIONS or typed. (w, h) or None."""
     win = tk.Toplevel(parent)
@@ -1462,6 +1648,7 @@ class App:
                       ("Cut", "Ctrl+X", lambda: self.copy_sel(True)),
                       ("Copy", "Ctrl+C", self.copy_sel),
                       ("Paste at playhead", "Ctrl+V", self.paste), None,
+                      ("Auto captions…", "", self.auto_captions), None,
                       ("Split at playhead", "Ctrl+B", self.split),
                       ("Delete", "Del", self.delete_sel),
                       ("Ripple delete", "Shift+Del", lambda: self.delete_sel(True)),
@@ -1513,8 +1700,12 @@ class App:
         st.pack(side="bottom", fill="x", padx=6, pady=(4, 6))
         self.prog = ttk.Progressbar(st, length=160, maximum=100)
         self.prog.pack(side="left")
+        self.cap_btn = self.btn(st, "Cancel captions", self.cancel_captions,
+                                style="ToolText.TButton")   # shown while captions are made
         self.status = ttk.Label(st, text="Detecting encoders...", style="PanelMuted.TLabel")
         self.status.pack(side="left", padx=10)
+        self.cap_proc = None   # None = idle, False = starting, a Popen while whisper runs
+        self.cap_cancel = False
         # preview above, timeline below; drag the bar between them to resize
         self.paned = tk.PanedWindow(self.root, orient="vertical", bg=BG, bd=0, sashwidth=6,
                                     sashrelief="flat", sashcursor="sb_v_double_arrow",
@@ -1976,6 +2167,14 @@ class App:
               ("Fade", [("fade_in", "Fade in", 0, 10, 0.02, "{:.2f} s", True),
                         ("fade_out", "Fade out", 0, 10, 0.02, "{:.2f} s", True)]),
               ("Speed", [("speed", "Speed", 10, 400, 0.5, "{:.0f}%", True)])],
+        "c": [("Caption", []),
+              ("Transform", [("zoom", "Size", 0.2, 4.0, 0.005, "{:.3f}", True),
+                             ("pos_x", "Position X", -10000, 10000, 1, "{:.0f}", False),
+                             ("pos_y", "Position Y", -10000, 10000, 1, "{:.0f}", False),
+                             ("rotation", "Rotation", -180, 180, 0.5, "{:.1f}°", True)]),
+              ("Composite", [("opacity", "Opacity", 0, 100, 0.5, "{:.0f}%", True)]),
+              ("Fade", [("fade_in", "Fade in", 0, 10, 0.02, "{:.2f} s", True),
+                        ("fade_out", "Fade out", 0, 10, 0.02, "{:.2f} s", True)])],
         "a": [("Audio", [("volume", "Volume", -60, 12, 0.1, "{:+.1f} dB", True),
                          ("pan", "Pan", -1, 1, 0.01, "{:+.2f}", True)]),
               ("Fade", [("fade_in", "Fade in", 0, 10, 0.02, "{:.2f} s", True),
@@ -1986,7 +2185,7 @@ class App:
     def build_inspector(self):
         box = ttk.Frame(self.hpane, style="Panel.TFrame", padding=(12, 8, 4, 8))
         self.hpane.add(box, minsize=280, width=380, stretch="never")
-        self.insp_kind = "v"          # tab shown: "v" (video / image) or "a"
+        self.insp_kind = "v"          # tab shown: "v" (video / image), "a" or "c" (caption)
         self.insp_focus = None        # id of the clip last clicked
         self.insp_before = self.insp_job = self.insp_sig = self.insp_shown = None
         head = ttk.Frame(box, style="Panel.TFrame")
@@ -1994,7 +2193,7 @@ class App:
         ttk.Label(head, text="Inspector", style="Panel.TLabel",
                   font=("Segoe UI Semibold", 11)).pack(side="left")
         self.insp_tabs = {}
-        for kind in ("a", "v"):
+        for kind in ("a", "v", "c"):
             self.insp_tabs[kind] = self.btn(head, "", lambda k=kind: self.set_insp_tab(k),
                                             style="ToolText.TButton")
         self.insp_name = ttk.Label(box, text="", style="PanelMuted.TLabel", font=SMALL_FONT)
@@ -2020,6 +2219,18 @@ class App:
                           font=("Segoe UI Semibold", 10)).grid(row=r, column=0, columnspan=4,
                                                                sticky="w", pady=(10 if r else 0, 2))
                 r += 1
+                if kind == "c" and title == "Caption":   # the text, edited in place
+                    self.cap_text = tk.Text(body, height=3, width=30, wrap="word", bg=FIELD,
+                                            fg=FG, insertbackground=FG, relief="flat",
+                                            font=UI_FONT, padx=6, pady=4, undo=False)
+                    self.cap_text.grid(row=r, column=0, columnspan=4, sticky="ew", pady=(2, 2))
+                    self.cap_text.bind("<KeyRelease>", lambda e: self.cap_typed())
+                    self.cap_text.bind("<Control-z>", lambda e: (self.undo(), "break")[1])
+                    r += 1
+                    ttk.Label(body, text="Enter makes a new line; Ctrl+Z undoes.",
+                              style="PanelMuted.TLabel", font=SMALL_FONT).grid(
+                        row=r, column=0, columnspan=4, sticky="w")
+                    r += 1
                 for key, label, lo, hi, step, fmt, slider in rows:
                     self.fields[(kind, key)] = SlideField(
                         body, r, label, lo, hi, step, fmt, CLIP_DEFAULTS[key],
@@ -2052,6 +2263,10 @@ class App:
             self.btn(body, "Reset all", lambda k=kind: self.insp_reset(k),
                      style="ToolText.TButton").grid(row=r, column=0, columnspan=4, sticky="w",
                                                     pady=(12, 4))
+            if kind in ("v", "a"):
+                self.btn(body, "Auto captions…", lambda: self.auto_captions(),
+                         style="ToolText.TButton").grid(row=r + 1, column=0, columnspan=4,
+                                                        sticky="w", pady=(0, 4))
             self.insp_body[kind] = body
         self.insp_win = self.insp_cv.create_window(0, 0, anchor="nw")
         self.insp_cv.bind("<Configure>",
@@ -2069,9 +2284,14 @@ class App:
         if w is self.insp_cv:
             self.insp_cv.yview_scroll(-e.delta // 120, "units")
 
+    @staticmethod
+    def ikind(c):
+        """Inspector tab of a clip: "c" for captions, else its kind."""
+        return "c" if "caption" in c else c["kind"]
+
     def insp_clips(self, kind):
         """Selected clips the inspector edits on this tab; the clicked one comes first."""
-        chosen = [c for c in self.clips if c["id"] in self.sel and c["kind"] == kind]
+        chosen = [c for c in self.clips if c["id"] in self.sel and self.ikind(c) == kind]
         chosen.sort(key=lambda c: c["id"] != self.insp_focus)
         return chosen
 
@@ -2085,7 +2305,7 @@ class App:
                 tuple(sorted(clips[0].items())) if clips else None)
 
     def refresh_inspector(self, force=False):
-        kinds = [k for k in ("v", "a") if self.insp_clips(k)]
+        kinds = [k for k in ("c", "v", "a") if self.insp_clips(k)]
         if kinds and self.insp_kind not in kinds:
             self.insp_kind = kinds[0]
         sig = self.insp_signature()
@@ -2097,7 +2317,8 @@ class App:
             if kind in kinds:
                 vc = self.insp_clips("v")
                 image = kind == "v" and self.media.get(vc[0]["path"], {}).get("image")
-                b.config(text="Image" if image else ("Video" if kind == "v" else "Audio"),
+                b.config(text="Caption" if kind == "c" else "Image" if image else
+                         ("Video" if kind == "v" else "Audio"),
                          style="ToolTextOn.TButton" if kind == self.insp_kind else "ToolText.TButton")
                 b.pack(side="right", padx=(2, 0))
             else:
@@ -2112,7 +2333,8 @@ class App:
         self.insp_empty.pack_forget()
         c = clips[0]
         more = f"   (+{len(clips) - 1} more)" if len(clips) > 1 else ""
-        self.insp_name.config(text=Path(c["path"]).name[:40] + more)
+        self.insp_name.config(text=("Caption at " + fmt_time(c["start"]) if "caption" in c
+                                    else Path(c["path"]).name[:40]) + more)
         if self.insp_shown != self.insp_kind:   # layout work only when the tab changes
             body = self.insp_body[self.insp_kind]
             self.insp_cv.itemconfig(self.insp_win, window=body)
@@ -2128,6 +2350,10 @@ class App:
             if key in ("fade_in", "fade_out"):
                 f.hi = max(0.1, min(10.0, c["dur"]))
             f.show(cp(c, key))
+        if self.insp_kind == "c" and self.root.focus_get() is not self.cap_text:
+            if self.cap_text.get("1.0", "end-1c") != c["caption"]:
+                self.cap_text.delete("1.0", "end")
+                self.cap_text.insert("1.0", c["caption"])
 
     def set_prop(self, c, key, value):
         if value == CLIP_DEFAULTS[key]:
@@ -2165,8 +2391,26 @@ class App:
             if self.replay_job:
                 self.root.after_cancel(self.replay_job)
             self.replay_job = self.root.after(300, self.replay)
-        elif kind == "v":
+        elif kind in ("v", "c"):
             self.queue_live()
+
+    def cap_typed(self):
+        """Typing in the Caption box: the focused caption takes the text (one undo step per
+        run of typing, like a slider)."""
+        clips = self.insp_clips("c")
+        text = self.cap_text.get("1.0", "end-1c").strip()
+        if not clips or not text or clips[0]["caption"] == text:
+            return
+        if self.insp_before is None:
+            self.insp_before = self.snapshot()
+        clips[0]["caption"] = text
+        self.insp_sig = self.insp_signature()
+        if self.insp_job:
+            self.root.after_cancel(self.insp_job)
+        self.insp_job = self.root.after(800, self.insp_commit)
+        self.draw_timeline_soon()
+        self.queue_live()
+        self.schedule_frame(500)
 
     def set_speed(self, clips, pct):
         """A new speed (%) keeps the same part of the file, so the clip gets shorter or longer;
@@ -2326,15 +2570,19 @@ class App:
             _, _, y0, y1 = self.row_of(cl["kind"], cl["track"])
             x0 = max(x0, HEAD_W)
             video = cl["kind"] == "v"
+            caption = "caption" in cl
+            body, dark = ((CLIP_C, CLIP_C_D) if caption else (CLIP_V, CLIP_V_D) if video
+                          else (CLIP_A, CLIP_A_D))
             tr = self.tracks(cl["kind"])[cl["track"]]
             off = tr.get("hidden") or tr.get("muted")
             sel = cl["id"] in self.sel
             X0 = self.t2x(cl["start"])
             cy0, cy1 = y0 + 2, y1 - 3
-            c.create_rectangle(x0 + 1, cy0, x1 - 1, cy1, fill=CLIP_V if video else CLIP_A,
-                               outline="")
-            name_h = 14 if cy1 - cy0 >= 30 else 0
-            if video:
+            c.create_rectangle(x0 + 1, cy0, x1 - 1, cy1, fill=body, outline="")
+            name_h = 14 if cy1 - cy0 >= 30 and not caption else 0
+            if caption:
+                pass   # the text is the label
+            elif video:
                 self.draw_thumbs(cl, X0, x0 + 1, min(x1 - 1, w), cy0, cy1 - name_h)
             else:
                 self.draw_wave(cl, X0, x0 + 1, min(x1 - 1, w), cy0, cy1 - name_h)
@@ -2346,13 +2594,12 @@ class App:
                     c.create_polygon(xa, cy0, xb, cy0, xa, cy1, fill="#000000", stipple="gray50",
                                      outline="")
             if name_h:
-                c.create_rectangle(x0 + 1, cy1 - name_h, x1 - 1, cy1,
-                                   fill=CLIP_V_D if video else CLIP_A_D, outline="")
+                c.create_rectangle(x0 + 1, cy1 - name_h, x1 - 1, cy1, fill=dark, outline="")
             if off:
                 c.create_rectangle(x0 + 1, cy0, x1 - 1, cy1, fill="#000000", stipple="gray50",
                                    outline="")
-            c.create_rectangle(x0 + 1, cy0, x1 - 1, cy1, outline="white" if sel else
-                               (CLIP_V_D if video else CLIP_A_D), width=2 if sel else 1)
+            c.create_rectangle(x0 + 1, cy0, x1 - 1, cy1, outline="white" if sel else dark,
+                               width=2 if sel else 1)
             if self.hover and self.hover[0] == cl["id"]:
                 # trim handles: drag either end to make the clip shorter / longer
                 for side, hx in (("left", x0 + 1), ("right", x1 - 6)):
@@ -2364,6 +2611,8 @@ class App:
             room = int((x1 - x0 - 12) / 6.5)
             if room > 2 and y1 - y0 >= 20:
                 label = f"{Path(cl['path']).name}   {fmt_time(cl['dur'])}"
+                if caption:
+                    label = cl["caption"].replace("\n", " ")
                 if cp(cl, "speed") != 100:
                     label += f"   {cp(cl, 'speed'):.0f}%"
                 if cl["link"]:
@@ -2649,7 +2898,7 @@ class App:
             return
         if cl["id"] != self.insp_focus:
             self.insp_commit()   # edits to the previous clip are their own undo step
-        self.insp_focus, self.insp_kind = cl["id"], cl["kind"]
+        self.insp_focus, self.insp_kind = cl["id"], self.ikind(cl)
         self.root.after_idle(self.prefetch_sources)
         group = {cl["id"]} if e.state & 0x20000 else self.linked(cl)
         if additive:
@@ -2808,6 +3057,13 @@ class App:
             menu.add_separator()
             menu.add_command(label="Unlink audio / video" if cl["link"] else "Link selected clips",
                              command=self.toggle_link)
+            menu.add_command(label="Auto captions…", command=self.auto_captions,
+                             state="normal" if self.caption_sources() else "disabled")
+            menu.add_separator()
+            kind, i = cl["kind"], cl["track"]
+            menu.add_command(label=f"Delete track {kind.upper()}{i + 1}",
+                             command=lambda: self.delete_track(kind, i),
+                             state="normal" if len(self.tracks(kind)) > 1 else "disabled")
         menu.tk_popup(e.x_root, e.y_root)
 
     # ---------- render graph ----------
@@ -2831,7 +3087,11 @@ class App:
             for ti, tr in enumerate(self.vtracks):
                 if tr["hidden"]:
                     continue
+                caps = []
                 for c, s, e in spans("v", ti):
+                    if "caption" in c:   # drawn by one ass filter per track, below
+                        caps.append((c, s, e))
+                        continue
                     if self.media[c["path"]]["image"]:
                         inputs += ["-loop", "1", "-framerate", str(fps), "-t", f"{e - s:.3f}"]
                     else:
@@ -2845,6 +3105,11 @@ class App:
                                  f"(H-h)/2-{cp(c, 'pos_y') * k:.2f}:eof_action=pass[o{n}]")
                     vout = f"[o{n}]"
                     n += 1
+                if caps:
+                    ass, fonts = self.write_ass(caps, t0)
+                    parts.append(f"{vout}ass=filename='{ff_path(ass)}':fontsdir='{ff_path(fonts)}'"
+                                 f"[cap{ti}]")
+                    vout = f"[cap{ti}]"
         if audio:
             labels = []
             for ti, tr in enumerate(self.atracks):
@@ -2865,6 +3130,58 @@ class App:
                              f"duration=first:normalize=0[amix]")
                 aout = "[amix]"
         return inputs, parts, vout, aout, n
+
+    def write_ass(self, caps, t0):
+        """An .ass file with these caption clips, timed from t0, in frame pixels (libass scales
+        it to the render size). Each clip's inspector settings become override tags. Returns
+        (file, fonts folder); files are named by their content, so renders running at the same
+        time never share a file that changes."""
+        fs, bord = caption_style(self.vw, self.vh)
+        font = caption_font_file()
+        family = caption_font(fs).getname()[0] if font else "Arial"
+        fonts = CACHE_DIR / "fonts"
+        lines = []
+        for c, s, e in caps:
+            x, y = self.vw / 2 + cp(c, "pos_x"), self.vh / 2 - cp(c, "pos_y")
+            z = cp(c, "zoom") * 100
+            tags = f"\\an5\\pos({x:.1f},{y:.1f})\\fscx{z:.1f}\\fscy{z:.1f}"
+            if cp(c, "rotation"):
+                tags += f"\\frz{-cp(c, 'rotation'):.2f}"   # libass turns counterclockwise
+            if cp(c, "opacity") < 100:
+                tags += f"\\alpha&H{round(255 * (1 - cp(c, 'opacity') / 100)):02X}&"
+            fi, fo = cp(c, "fade_in"), cp(c, "fade_out")
+            if fi or fo:   # times from this event's start, which may be inside the clip
+                t1 = -round((s - c["start"]) * 1000)
+                d = round(c["dur"] * 1000)
+                tags += (f"\\fade(255,0,255,{t1},{t1 + round(fi * 1000)},"
+                         f"{t1 + d - round(fo * 1000)},{t1 + d})")
+            text = "\\N".join(caption_lines(c["caption"], self.vw, self.vh))
+            text = text.replace("{", "(").replace("}", ")")
+            lines.append(f"Dialogue: 0,{ass_time(s - t0)},{ass_time(e - t0)},Cap,,0,0,0,,"
+                         f"{{{tags}}}{text}")
+        data = ("[Script Info]\nScriptType: v4.00+\n"
+                f"PlayResX: {self.vw}\nPlayResY: {self.vh}\nWrapStyle: 2\n"
+                "ScaledBorderAndShadow: yes\n\n[V4+ Styles]\n"
+                "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, "
+                "BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, "
+                "BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
+                f"Style: Cap,{family},{fs},&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,"
+                f"-1,0,0,0,100,100,0,0,1,{bord},0,5,0,0,0,1\n\n[Events]\n"
+                "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+                + "\n".join(lines) + "\n")
+        path = CACHE_DIR / f"cap_{hashlib.md5(data.encode('utf-8')).hexdigest()[:16]}.ass"
+        try:
+            if font and not (fonts / font.name).exists():
+                fonts.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(font, fonts / font.name)   # only this font, so libass starts fast
+            if not path.exists():
+                CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                tmp = path.with_suffix(f".{threading.get_ident()}.tmp")
+                tmp.write_text(data, encoding="utf-8")
+                os.replace(tmp, path)
+        except OSError:
+            pass
+        return path, fonts
 
     def video_chain(self, c, s, t0, W, H, fps):
         """Filters for one visual clip: crop, flip, fit * zoom, rotate, opacity, fades, timing.
@@ -2955,7 +3272,7 @@ class App:
         t = self.frame_t()
         W, H = self.preview_size()
         layers = self.visible_layers(t)
-        missing = [c for c in layers if self.src_key(c, t) not in self.src_cache]
+        missing = [c for c in layers if "caption" not in c and self.src_key(c, t) not in self.src_cache]
         if missing:
             self.live_wanted = True
             self.fetch_sources(missing, t, W, H)
@@ -2964,21 +3281,24 @@ class App:
         out = Image.new("RGB", (W, H), "black")
         k = W / max(self.vw, 1)
         for c in layers:
-            im = self.src_cache[self.src_key(c, t)]
-            cl, cr, ct, cb = (cp(c, x) / 100 for x in ("crop_l", "crop_r", "crop_t", "crop_b"))
-            if cl or cr or ct or cb:
-                iw, ih = im.size
-                x0, y0 = round(iw * cl), round(ih * ct)
-                im = im.crop((x0, y0, max(x0 + 1, round(iw * (1 - cr))),
-                              max(y0 + 1, round(ih * (1 - cb)))))
-            if cp(c, "flip_h"):
-                im = im.transpose(Image.FLIP_LEFT_RIGHT)
-            if cp(c, "flip_v"):
-                im = im.transpose(Image.FLIP_TOP_BOTTOM)
-            z = cp(c, "zoom")
-            r = min(W * z / im.width, H * z / im.height)
-            im = im.resize((max(2, round(im.width * r) // 2 * 2),
-                            max(2, round(im.height * r) // 2 * 2)), Image.BILINEAR)
+            if "caption" in c:   # drawn with the export's font, size and outline
+                im = caption_image(c["caption"], self.vw, self.vh, k * cp(c, "zoom"))
+            else:
+                im = self.src_cache[self.src_key(c, t)]
+                cl, cr, ct, cb = (cp(c, x) / 100 for x in ("crop_l", "crop_r", "crop_t", "crop_b"))
+                if cl or cr or ct or cb:
+                    iw, ih = im.size
+                    x0, y0 = round(iw * cl), round(ih * ct)
+                    im = im.crop((x0, y0, max(x0 + 1, round(iw * (1 - cr))),
+                                  max(y0 + 1, round(ih * (1 - cb)))))
+                if cp(c, "flip_h"):
+                    im = im.transpose(Image.FLIP_LEFT_RIGHT)
+                if cp(c, "flip_v"):
+                    im = im.transpose(Image.FLIP_TOP_BOTTOM)
+                z = cp(c, "zoom")
+                r = min(W * z / im.width, H * z / im.height)
+                im = im.resize((max(2, round(im.width * r) // 2 * 2),
+                                max(2, round(im.height * r) // 2 * 2)), Image.BILINEAR)
             local = t - c["start"]
             alpha = cp(c, "opacity") / 100
             fi, fo = cp(c, "fade_in"), cp(c, "fade_out")
@@ -2994,6 +3314,8 @@ class App:
                 if alpha < 1:
                     im.putalpha(im.getchannel("A").point(lambda v: int(v * alpha)))
                 mask = im
+            elif im.mode == "RGBA":
+                mask = im
             out.paste(im, (round((W - im.width) / 2 + cp(c, "pos_x") * k),
                            round((H - im.height) / 2 - cp(c, "pos_y") * k)), mask)
         self.req += 1   # an FFmpeg frame still on its way has the old settings; drop it
@@ -3006,6 +3328,8 @@ class App:
         zooming in stays sharp) in the background."""
         todo = []
         for c in clips:
+            if "caption" in c:
+                continue
             key = self.src_key(c, t)
             if key not in self.src_pending and key not in self.src_cache:
                 self.src_pending.add(key)
@@ -3094,6 +3418,14 @@ class App:
                         self.status.config(text="Ready" + (f"   ·   GPU encoding: {', '.join(gpus)}"
                                                            if gpus else "") +
                                            (f"   ·   {self.dnd_off}" if self.dnd_off else ""))
+                elif kind == "cap":
+                    self.status.config(text=msg[1])
+                    if msg[2] is not None:
+                        self.prog["value"] = msg[2] * 100
+                elif kind == "capclips":
+                    self.add_captions(msg[1], msg[2])
+                elif kind == "capdone":
+                    self.finish_captions(msg[1], msg[2])
                 elif kind == "progress":
                     self.prog["value"] = msg[1] * 100
                     self.status.config(text=f"Exporting...  {msg[1]:.0%}")
@@ -3521,6 +3853,11 @@ class App:
     def clip_geom(self, c):
         """(center x, center y, width, height, rotation) of a visual clip in frame pixels,
         placed the way graph() places it."""
+        if "caption" in c:
+            w, h = caption_image(c["caption"], self.vw, self.vh, 1.0).size
+            z = cp(c, "zoom")
+            return (self.vw / 2 + cp(c, "pos_x"), self.vh / 2 - cp(c, "pos_y"), w * z, h * z,
+                    cp(c, "rotation"))
         m = self.media.get(c["path"]) or {}
         iw, ih = m.get("size") or (self.vw, self.vh)
         iw *= max(1 - (cp(c, "crop_l") + cp(c, "crop_r")) / 100, 0.02)
@@ -3592,7 +3929,7 @@ class App:
             if c["id"] not in self.sel:
                 self.insp_commit()
                 self.sel = set(self.linked(c))
-            self.insp_focus, self.insp_kind = c["id"], "v"
+            self.insp_focus, self.insp_kind = c["id"], self.ikind(c)
             self.draw_timeline()
             movers = [x for x in self.clips if x["id"] in self.sel and x["kind"] == "v"]
             cx, cy = self.clip_geom(c)[:2]
@@ -3698,6 +4035,187 @@ class App:
         self.mark_in = self.mark_out = None
         self.update_range()
         self.draw_timeline()
+
+    # ---------- auto captions ----------
+    def caption_sources(self):
+        """Selected clips with sound to caption: one per linked video / audio pair."""
+        out, links = [], set()
+        for c in self.clips:
+            if c["id"] not in self.sel or "caption" in c:
+                continue
+            m = self.media.get(c["path"]) or {}
+            if not m.get("audio") or m.get("image"):
+                continue
+            if c["link"]:
+                if c["link"] in links:
+                    continue
+                links.add(c["link"])
+            out.append(c)
+        return out
+
+    def auto_captions(self):
+        clips = self.caption_sources()
+        if not clips:
+            messagebox.showinfo("Auto captions", "Select a video or audio clip with sound first.")
+            return
+        if self.cap_proc is not None:
+            messagebox.showinfo("Auto captions", "Captions are being made already.")
+            return
+        if not whisper_exe():
+            messagebox.showerror("Auto captions", "whisper-cli was not found. Reinstall q-edit, "
+                                 "or put whisper.cpp's whisper-cli.exe on PATH.")
+            return
+        self.pause()
+        CaptionDialog(self, clips)
+
+    def start_captions(self, clips, lang, model, max_chars):
+        jobs = [dict(c) for c in clips]
+        self.cap_proc = False   # running (a Popen while whisper works)
+        self.cap_cancel = False
+        self.cap_btn.pack(side="left", padx=(0, 10))
+        self.prog["value"] = 0
+        threading.Thread(target=self.run_captions, args=(jobs, lang, model, max_chars),
+                         daemon=True).start()
+
+    def cancel_captions(self):
+        self.cap_cancel = True
+        if self.cap_proc:
+            try:
+                self.cap_proc.kill()
+            except OSError:
+                pass
+
+    def run_captions(self, jobs, lang, model, max_chars):
+        """Background thread: download the model if needed, then per clip: its sound as 16 kHz
+        WAV -> whisper-cli (word timestamps as JSON) -> captions on timeline time."""
+        def say(text, frac=None):
+            self.q.put(("cap", text, frac))
+        try:
+            path = MODELS_DIR / model
+            if not path.exists():
+                MODELS_DIR.mkdir(parents=True, exist_ok=True)
+                part = path.with_suffix(".part")
+                with urllib.request.urlopen(MODEL_URL + model, timeout=30) as r, open(part, "wb") as f:
+                    total, got = int(r.headers.get("Content-Length") or 0), 0
+                    while True:
+                        if self.cap_cancel:
+                            raise InterruptedError
+                        block = r.read(1 << 20)
+                        if not block:
+                            break
+                        f.write(block)
+                        got += len(block)
+                        say(f"Downloading the speech model...  {got / 1048576:.0f} / "
+                            f"{total / 1048576:.0f} MB", got / total if total else None)
+                if total and got != total:
+                    raise OSError("the download was cut off")
+                os.replace(part, path)
+            CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            wav = CACHE_DIR / "captions_audio.wav"
+            out = CACHE_DIR / "captions_words"
+            for n, c in enumerate(jobs):
+                if self.cap_cancel:
+                    raise InterruptedError
+                name = Path(c["path"]).name
+                say(f"Captions {n + 1}/{len(jobs)}: reading the sound of {name}...", 0)
+                k = spd(c)
+                r = subprocess.run(["ffmpeg", "-y", "-v", "error", "-ss", f"{c['inp']:.3f}",
+                                    "-t", f"{c['dur'] * k:.3f}", "-i", c["path"], "-vn", "-ac", "1",
+                                    "-ar", "16000", "-c:a", "pcm_s16le", str(wav)],
+                                   capture_output=True, text=True, creationflags=NOWIN)
+                if r.returncode:
+                    raise OSError(r.stderr.strip()[-300:] or "FFmpeg could not read the sound")
+                say(f"Captions {n + 1}/{len(jobs)}: listening to {name}...", 0)
+                try:
+                    os.remove(out.with_suffix(".json"))
+                except OSError:
+                    pass
+                self.cap_proc = subprocess.Popen(
+                    [whisper_exe(), "-m", str(path), "-f", str(wav), "-l", lang, "-oj",
+                     "-of", str(out), "-ml", "1", "-sow", "-np", "-pp",
+                     "-t", str(max(2, (os.cpu_count() or 4) - 2))],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
+                    creationflags=BGWIN, text=True, errors="replace")
+                tail = []
+                for line in self.cap_proc.stderr:
+                    m = re.search(r"progress\s*=\s*(\d+)%", line)
+                    if m:
+                        say(f"Captions {n + 1}/{len(jobs)}: listening to {name}...  {m.group(1)}%",
+                            int(m.group(1)) / 100)
+                    else:
+                        tail = (tail + [line.strip()])[-4:]
+                rc = self.cap_proc.wait()
+                if self.cap_cancel:
+                    raise InterruptedError
+                if rc:
+                    raise OSError("whisper failed: " + " ".join(tail)[-300:])
+                data = json.loads(out.with_suffix(".json").read_text(encoding="utf-8",
+                                                                      errors="replace"))
+                words = []
+                for seg in data.get("transcription", []):
+                    w = seg.get("text", "").strip()
+                    if not w or re.fullmatch(r"[\[(].*[\])]|[♪♫\s]+", w):
+                        continue   # [BLANK_AUDIO], (music) and the like
+                    a, b = seg["offsets"]["from"] / 1000, seg["offsets"]["to"] / 1000
+                    words.append((c["start"] + a / k, c["start"] + b / k, w))
+                end = c["start"] + c["dur"]
+                caps = [(a, min(b, end), t) for a, b, t in group_words(words, max_chars) if a < end]
+                self.q.put(("capclips", c, caps))
+            self.q.put(("capdone", True, ""))
+        except InterruptedError:
+            self.q.put(("capdone", False, ""))
+        except (OSError, ValueError, KeyError) as e:
+            self.q.put(("capdone", False, str(e) or e.__class__.__name__))
+
+    def caption_media(self):
+        """Caption clips point at a small transparent picture, so everything that handles image
+        clips (moving, trimming, saving, templates) handles them; the text is drawn by graph()."""
+        path = CACHE_DIR / "caption.png"
+        if not path.exists():
+            CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            Image.new("RGBA", (16, 16), (0, 0, 0, 0)).save(path)
+        path = str(path)
+        if path not in self.media:
+            self.media[path] = {"dur": IMAGE_DUR, "fps": 30.0, "audio": False, "video": True,
+                                "image": True, "size": (16, 16)}
+            self.thumbs[path] = (0, [])
+        return path
+
+    def add_captions(self, src, caps):
+        """Puts captions on a new video track at the top (one undo step per clip captioned)."""
+        if not caps:
+            self.status.config(text=f"No speech found in {Path(src['path']).name}")
+            return
+        before = self.snapshot()
+        if not self.vw:
+            self.set_frame((1920, 1080))
+        path = self.caption_media()
+        self.vtracks.append({"hidden": False})
+        track = len(self.vtracks) - 1
+        new = []
+        for a, b, text in caps:
+            c = {"id": self.new_id(), "kind": "v", "track": track, "path": path, "start": a,
+                 "inp": 0.0, "dur": max(b - a, MIN_CLIP), "link": None, "caption": text,
+                 "pos_y": float(-round(self.vh * 0.27))}
+            new.append(c)
+        self.clips += new
+        self.sel = {c["id"] for c in new}
+        self.insp_focus, self.insp_kind = new[0]["id"], "c"
+        self.commit(before)
+
+    def finish_captions(self, ok, err):
+        self.cap_proc = None
+        self.cap_btn.pack_forget()
+        self.prog["value"] = 100 if ok else 0
+        if ok:
+            n = sum(1 for c in self.clips if "caption" in c)
+            self.status.config(text=f"Captions done   ·   {n} on the timeline   ·   click one to "
+                                    f"fix its text")
+        elif err:
+            self.status.config(text="Captions failed")
+            messagebox.showerror("Auto captions", err)
+        else:
+            self.status.config(text="Captions cancelled")
 
     # ---------- export ----------
     def export(self):
@@ -3929,6 +4447,8 @@ class App:
         for c in data.get("clips", []):
             c = dict(c)
             rel = c.pop("rel", None)
+            if "caption" in c:   # the picture is only a stand-in; it lives in the cache
+                c["path"] = self.caption_media()
             if not os.path.exists(c["path"]) and rel and (base / rel).exists():
                 c["path"] = str((base / rel).resolve())
             if os.path.exists(c["path"]) and self.load_media(c["path"]):

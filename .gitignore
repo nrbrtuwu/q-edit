@@ -12,6 +12,7 @@ CLAUDE.md
 # build tools and outputs (rebuilt by packaging/build.ps1)
 packaging/.venv/
 packaging/ffmpeg_dl/
+packaging/whisper_dl/
 packaging/build/
 packaging/dist/
 packaging/Output/

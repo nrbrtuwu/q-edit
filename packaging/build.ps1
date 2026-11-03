@@ -6,6 +6,8 @@
 #   packaging\.venv\Scripts\python -m pip install pyinstaller pillow tkinterdnd2
 #   winget install JRSoftware.InnoSetup --scope user
 #   FFmpeg shared build unzipped into packaging\ffmpeg_dl (from github.com/BtbN/FFmpeg-Builds)
+#   whisper.cpp whisper-bin-x64.zip unzipped into packaging\whisper_dl\bin (from
+#   github.com/ggml-org/whisper.cpp releases; only whisper-cli + its DLLs are installed)
 # not "Stop": PyInstaller logs to stderr, which PowerShell 5.1 would treat as an error.
 # Failures are caught with $LASTEXITCODE checks below.
 $ErrorActionPreference = "Continue"
@@ -16,6 +18,8 @@ $py = Join-Path $here ".venv\Scripts\python.exe"
 $version = (Select-String -Path "$root\clip_editor.py" -Pattern '^APP_VERSION = "(.+)"').Matches[0].Groups[1].Value
 $ffmpeg = Get-ChildItem "$here\ffmpeg_dl" -Directory | Where-Object { Test-Path "$($_.FullName)\bin\ffmpeg.exe" } | Select-Object -First 1
 if (-not $ffmpeg) { throw "No FFmpeg build found in packaging\ffmpeg_dl" }
+$whisper = "$here\whisper_dl\bin\Release"
+if (-not (Test-Path "$whisper\whisper-cli.exe")) { throw "No whisper-cli.exe in packaging\whisper_dl\bin\Release" }
 $iscc = @("$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe", "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe") |
     Where-Object { Test-Path $_ } | Select-Object -First 1
 if (-not $iscc) { throw "Inno Setup not found (winget install JRSoftware.InnoSetup)" }
@@ -28,6 +32,6 @@ if ($LASTEXITCODE) { throw "icon failed" }
     --collect-data tkinterdnd2 `
     --distpath "$here\dist" --workpath "$here\build" --specpath "$here" "$root\clip_editor.py"
 if ($LASTEXITCODE) { throw "PyInstaller failed" }
-& $iscc "/DAppVersion=$version" "/DFFmpegDir=$($ffmpeg.FullName)" "$here\installer.iss"
+& $iscc "/DAppVersion=$version" "/DFFmpegDir=$($ffmpeg.FullName)" "/DWhisperDir=$whisper" "$here\installer.iss"
 if ($LASTEXITCODE) { throw "Inno Setup failed" }
 Get-Item "$here\Output\q-edit-Setup-$version.exe" | Select-Object Name, @{n="MB"; e={[math]::Round($_.Length / 1MB, 1)}}
