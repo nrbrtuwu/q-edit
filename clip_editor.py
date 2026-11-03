@@ -32,12 +32,14 @@ import os
 import queue
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import threading
 import time
 import tkinter as tk
 import urllib.request
+import wave
 import tkinter.font as tkfont
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
@@ -75,7 +77,7 @@ IMAGE_DUR = 5.0
 MIN_CLIP = 0.05
 MEDIA_TYPES = [("Media", "*.mp4 *.mov *.mkv *.avi *.webm *.m4v *.mp3 *.wav *.m4a *.aac *.flac "
                          "*.ogg *.png *.jpg *.jpeg *.bmp *.webp"), ("All files", "*.*")]
-APP_VERSION = "1.10.0"
+APP_VERSION = "1.11.0"
 FROZEN = getattr(sys, "frozen", False)  # True when running from the installed .exe
 APP_DIR = Path(sys.executable).parent if FROZEN else Path(__file__).parent
 DATA_DIR = Path(getattr(sys, "_MEIPASS", APP_DIR))
@@ -93,10 +95,23 @@ MODELS_DIR = USER_DIR / "models"
 CACHE_DIR = USER_DIR / "cache"   # caption .ass files, the caption font, the clips' audio for whisper
 MODEL_URL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/"
 WHISPER_MODELS = {"Fast": ("ggml-small-q5_1.bin", 190), "Accurate": ("ggml-large-v3-turbo-q5_0.bin", 574)}
+DTW_PRESETS = {"ggml-small-q5_1.bin": "small", "ggml-large-v3-turbo-q5_0.bin": "large.v3.turbo"}
+# whisper's DTW word times come out this late; measured against speech with known word times
+# (with the snap to the sound's onset after it: typical error 50 ms, none over 0.3 s)
+DTW_SHIFT = 0.17
 CAPTION_LANGS = {"English": "en", "Hungarian": "hu", "Detect automatically": "auto"}
 CAPTION_LENGTHS = {"Short (a few words, TikTok style)": 18, "Long (up to two lines)": 42}
 FONTS_DIR = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
-CAPTION_FONTS = ["segoeuib.ttf", "arialbd.ttf"]   # Segoe UI Bold, Arial Bold as a fallback
+CAPTION_FONT = "DFP King Gothic Medium"           # default; used when it is installed
+FALLBACK_FONTS = ["Segoe UI Bold", "Arial Bold"]   # otherwise, and for letters it doesn't have
+# a few of the most common words, to tell English and Hungarian sentences apart
+EN_WORDS = set("""the a an and or but of to in on at for with is are was were be been it this that
+these those you your i we they he she my our me us not no do does did have has had will would can
+could just so what if there here all about from up out get got like know""".split())
+HU_WORDS = set("""a az és hogy nem is egy de ez az meg van volt lesz csak már még mert ha mint vagy
+itt ott én te ő mi ti ők nekem neked engem téged ezt azt sem pedig akkor most nagyon kell lehet
+igen jó mit miért hol hogyan vagyok vagy vagyunk szia sziasztok köszönöm""".split())
+HU_LETTERS = set("áéíóöőúüű")
 HL_COLORS = {"Yellow": "#FFE000", "Green": "#3CFF6A", "Cyan": "#3CDCFF", "Pink": "#FF50D2",
              "Orange": "#FF9A1E", "Red": "#FF3C3C"}   # the spoken word in a caption
 
@@ -147,7 +162,8 @@ TRACK_MIN_H, TRACK_MAX_H = 24, 160
 CLIP_DEFAULTS = {"zoom": 1.0, "pos_x": 0.0, "pos_y": 0.0, "rotation": 0.0, "flip_h": False,
                  "flip_v": False, "crop_l": 0.0, "crop_r": 0.0, "crop_t": 0.0, "crop_b": 0.0,
                  "opacity": 100.0, "fade_in": 0.0, "fade_out": 0.0, "volume": 0.0, "pan": 0.0,
-                 "speed": 100.0, "keep_pitch": True, "highlight": True, "hl_color": "Yellow"}
+                 "speed": 100.0, "keep_pitch": True, "highlight": True, "hl_color": "Yellow",
+                 "font": "DFP King Gothic Medium"}
 THUMB_H = 72          # height thumbnails are extracted at
 PEAKS_PER_SEC = 100   # waveform resolution
 # glyphs from Segoe Fluent Icons / Segoe MDL2 Assets (built into Windows 10/11)
@@ -406,28 +422,112 @@ def whisper_exe():
     return shutil.which("whisper-cli")
 
 
-_cap_fonts = {}
+_cap_fonts, _font_list, _glyphs = {}, None, {}
 
 
-def caption_font_file():
-    return next((FONTS_DIR / f for f in CAPTION_FONTS if (FONTS_DIR / f).exists()), None)
+def installed_fonts():
+    """{font name: (file, index in a .ttc)} of the fonts installed for everyone and for this user,
+    as Windows lists them (e.g. "Segoe UI Bold")."""
+    global _font_list
+    if _font_list is None:
+        _font_list = {}
+        try:
+            import winreg
+        except ImportError:
+            return _font_list
+        key = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts"
+        for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+            try:
+                with winreg.OpenKey(hive, key) as k:
+                    for i in range(winreg.QueryInfoKey(k)[1]):
+                        name, value, _ = winreg.EnumValue(k, i)
+                        path = Path(value) if os.path.isabs(value) else FONTS_DIR / value
+                        ext = path.suffix.lower()
+                        if ext not in (".ttf", ".otf", ".ttc"):
+                            continue
+                        name = re.sub(r"\s*\((TrueType|OpenType)\)$", "", name)
+                        for n, part in enumerate(name.split(" & ")):
+                            _font_list[part.strip()] = (str(path), n if ext == ".ttc" else 0)
+            except OSError:
+                pass
+    return _font_list
 
 
-def caption_font(size):
+def font_face(name):
+    """An installed font's name for `name` (spaces and case don't matter), else the fallback."""
+    fonts = installed_fonts()
+    if name in fonts:
+        return name
+    squash = {k.lower().replace(" ", ""): k for k in fonts}
+    hit = squash.get((name or "").lower().replace(" ", ""))
+    return hit or next((f for f in FALLBACK_FONTS if f in fonts), None)
+
+
+def win_em(path, index=0):
+    """em size / line height the way libass sizes a font: unitsPerEm / (usWinAscent +
+    usWinDescent) from the font file's head and OS/2 tables (index = face in a .ttc). None if
+    the file can't be read that way."""
+    try:
+        with open(path, "rb") as f:
+            def at(pos, fmt):
+                f.seek(pos)
+                return struct.unpack(fmt, f.read(struct.calcsize(fmt)))
+            base = 0
+            if at(0, ">4s")[0] == b"ttcf":
+                base = at(12 + 4 * index, ">I")[0]
+            tables = {}
+            for i in range(at(base + 4, ">H")[0]):
+                tag, _, off, _ = at(base + 12 + 16 * i, ">4sIII")
+                tables[tag] = off
+            upem = at(tables[b"head"] + 18, ">H")[0]
+            asc, desc = at(tables[b"OS/2"] + 74, ">HH")
+        return upem / (asc + desc) if asc + desc else None
+    except (OSError, KeyError, struct.error):
+        return None
+
+
+def caption_font(size, name=CAPTION_FONT):
     """The caption font at a libass font size: libass sizes a font by its line height (ascent
     + descent), PIL by its em, so the PIL size is converted to make both draw the same text."""
-    size = max(4, int(round(size)))
-    if size not in _cap_fonts:
-        path = caption_font_file()
-        if path is None:
-            _cap_fonts[size] = ImageFont.load_default()
-        else:
-            probe_font = ImageFont.truetype(str(path), 1000)
-            a, d = probe_font.getmetrics()
-            _cap_fonts[size] = ImageFont.truetype(str(path), max(4, round(size * 1000 / (a + d))))
+    size, face = max(4, int(round(size))), font_face(name)
+    key = (size, face)
+    if key not in _cap_fonts:
         if len(_cap_fonts) > 64:
             _cap_fonts.clear()
-    return _cap_fonts.setdefault(size, ImageFont.load_default())
+        try:
+            path, index = installed_fonts()[face]
+            em = win_em(path, index)
+            if not em:
+                a, d = ImageFont.truetype(path, 1000, index=index).getmetrics()
+                em = 1000 / (a + d)
+            _cap_fonts[key] = ImageFont.truetype(path, max(4, round(size * em)), index=index)
+        except (KeyError, OSError):
+            _cap_fonts[key] = ImageFont.load_default()
+    return _cap_fonts[key]
+
+
+def has_glyphs(name, text):
+    """False when the font draws any letter of text as its "missing" box (e.g. ő in a font
+    made for another alphabet)."""
+    font = caption_font(48, name)
+    if "notdef" not in _glyphs.setdefault(name, {}):
+        _glyphs[name]["notdef"] = bytes(font.getmask("\U000F0000"))
+    seen = _glyphs[name]
+    for ch in set(text) - set(" \n"):
+        if ch not in seen:
+            seen[ch] = bytes(font.getmask(ch)) != seen["notdef"]
+        if not seen[ch]:
+            return False
+    return True
+
+
+def cap_font(c):
+    """The installed font a caption is drawn with: its own, or the fallback when that isn't
+    installed or lacks some of the caption's letters."""
+    face = font_face(cp(c, "font"))
+    if face and not has_glyphs(face, c["caption"]):
+        face = font_face(FALLBACK_FONTS[0])
+    return face
 
 
 def caption_style(vw, vh):
@@ -436,11 +536,11 @@ def caption_style(vw, vh):
     return fs, max(1, round(fs * 0.09))
 
 
-def caption_lines(text, vw, vh):
+def caption_lines(text, vw, vh, face=CAPTION_FONT):
     """Wraps a caption to 88% of the frame width (explicit line breaks are kept). Done here, not
     by libass, so the preview's own drawing breaks the lines at the same words."""
     fs, _ = caption_style(vw, vh)
-    font, out = caption_font(fs), []
+    font, out = caption_font(fs, face), []
     for para in text.split("\n"):
         line = ""
         for word in para.split():
@@ -455,12 +555,12 @@ def caption_lines(text, vw, vh):
     return out or [""]
 
 
-def caption_image(text, vw, vh, scale, active=None, color="#FFE000"):
+def caption_image(text, vw, vh, scale, active=None, color="#FFE000", face=CAPTION_FONT):
     """The caption drawn like the export draws it (white, black outline, centered lines), at
     `scale` times frame pixels, as RGBA. active = index of the word drawn in `color`."""
     fs, bord = caption_style(vw, vh)
-    font = caption_font(fs * scale)
-    lines = caption_lines(text, vw, vh)
+    font = caption_font(fs * scale, face)
+    lines = caption_lines(text, vw, vh, face)
     lh, b = max(1, round(fs * scale)), max(1, round(bord * scale))
     widths = [font.getlength(t) for t in lines]
     W, H = int(max(widths) + 2 * b + 2), int(lh * len(lines) + 2 * b)
@@ -520,20 +620,117 @@ def ff_path(path):
     return str(path).replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
 
 
+def audio_envelope(wav):
+    """Loudness in dB of a 16 kHz mono WAV, per 10 ms."""
+    with wave.open(str(wav)) as w:
+        a = array("h", w.readframes(w.getnframes()))
+    return [10 * math.log10(sum(v * v for v in a[i:i + 160]) / 160 + 1)
+            for i in range(0, len(a) - 159, 160)]
+
+
+def snap_onsets(starts, env, back=0.25, fwd=0.12, rise_db=12):
+    """Moves each word start to the strongest rise in loudness near it (where the word's sound
+    begins), never past its neighbours; a start with no clear rise nearby stays."""
+    out = []
+    for i, t in enumerate(starts):
+        lo, hi = int((t - back) * 100), int((t + fwd) * 100)
+        if out:
+            lo = max(lo, int(out[-1] * 100) + 5)
+        if i + 1 < len(starts):
+            hi = min(hi, int(starts[i + 1] * 100) - 3)
+        lo, hi = max(lo, 3), min(hi, len(env) - 1)
+        best, bt = 0.0, t
+        for k in range(lo, hi + 1):
+            rise = env[k] - min(env[k - 3:k])
+            if rise > best:
+                best, bt = rise, k / 100
+        out.append(bt if best >= rise_db else t)
+    return out
+
+
+def whisper_sentences(data, env):
+    """whisper-cli -ojf -dtw output -> sentences [(start, end, text, [(start, end, word)])] in
+    seconds of the WAV. Word starts: DTW token times, DTW_SHIFT earlier, snapped to the onset of
+    the sound; a word ends where the next one starts, or earlier at a silence."""
+    sents = []
+    for seg in data.get("transcription", []):
+        words = []
+        for t in seg.get("tokens", []):
+            txt = t.get("text", "")
+            if txt.startswith("[_") or not txt.strip():
+                continue
+            at = t["t_dtw"] / 100 if t.get("t_dtw", -1) >= 0 else t["offsets"]["from"] / 1000
+            if txt.startswith(" ") or not words:
+                words.append([at - DTW_SHIFT, txt.strip()])
+            else:
+                words[-1][1] += txt   # the rest of a word split into several tokens
+        if words:
+            sents.append([seg["offsets"]["from"] / 1000, seg["offsets"]["to"] / 1000,
+                          seg.get("text", "").strip(), words])
+    flat = [w for s in sents for w in s[3]]
+    for w, t in zip(flat, snap_onsets([max(0.0, w[0]) for w in flat], env)):
+        w[0] = t
+    srt = sorted(env)
+    quiet = srt[len(srt) // 10] + max(6.0, (srt[len(srt) * 9 // 10] - srt[len(srt) // 10]) * 0.25) \
+        if srt else 0.0
+    out, i = [], -1
+    for s in sents:
+        ws = []
+        for w in s[3]:
+            i += 1
+            nxt = flat[i + 1][0] if i + 1 < len(flat) else w[0] + 1.0
+            end, k, run = nxt, int((w[0] + 0.12) * 100), 0
+            while k < min(int(nxt * 100), len(env)):   # 0.25 s of quiet ends the word
+                run = run + 1 if env[k] < quiet else 0
+                if run >= 25:
+                    end = (k - 24) / 100
+                    break
+                k += 1
+            ws.append((w[0], max(end, w[0] + 0.05), w[1]))
+        loud = max(env[int(ws[0][0] * 100):int(ws[-1][1] * 100) + 1] or [0.0])
+        out.append((ws[0][0], ws[-1][1], s[2], ws, loud > quiet))
+    return out
+
+
+def text_language(text):
+    """'en' or 'hu' when the words clearly say so, else None."""
+    words = re.findall(r"[^\W\d_]+", text.lower())
+    hu = sum(w in HU_WORDS for w in words) + 2 * sum(any(ch in HU_LETTERS for ch in w) for w in words)
+    en = sum(w in EN_WORDS for w in words)
+    if en >= 2 and en > hu:
+        return "en"
+    if hu >= 2 and hu > en:
+        return "hu"
+    return None
+
+
 def group_words(words, max_chars):
     """Timed words -> captions [(start, end, text, words)]: a caption ends at a sentence end, a
     pause, or when it would get longer than max_chars."""
     caps, cur = [], []
 
     def flush():
-        if cur:
-            caps.append([cur[0][0], cur[-1][1], " ".join(w for _, _, w in cur), list(cur)])
-            cur.clear()
+        """A phrase too long for one caption is cut into even parts, so no caption is left
+        with one or two stray words."""
+        if not cur:
+            return
+        n = -(-len(" ".join(w for _, _, w in cur)) // max_chars)
+        target = len(" ".join(w for _, _, w in cur)) / max(n, 1)
+        part, size = [], 0
+        for item in cur:
+            add = len(item[2]) + (1 if part else 0)
+            if part and n > 1 and size + add / 2 > target:
+                caps.append([part[0][0], part[-1][1], " ".join(w for _, _, w in part), part])
+                part, size, n, add = [], 0, n - 1, len(item[2])
+            part.append(item)
+            size += add
+        caps.append([part[0][0], part[-1][1], " ".join(w for _, _, w in part), part])
+        cur.clear()
     for a, b, w in words:
         if cur:
             text = " ".join(x for _, _, x in cur)
-            if (len(text) + 1 + len(w) > max_chars or a - cur[-1][1] > 0.7
-                    or text[-1] in ".?!" or b - cur[0][0] > (3.0 if max_chars < 30 else 6.0)):
+            if (a - cur[-1][1] > 0.7 or text[-1] in ".?!"
+                    or b - cur[0][0] > (3.0 if max_chars < 30 else 6.0) * 2):
                 flush()
         cur.append((a, b, w))
     flush()
@@ -2286,6 +2483,14 @@ class App:
                     box.bind("<<ComboboxSelected>>", lambda e: (
                         self.insp_set("c", "hl_color", self.hl_var.get()), self.insp_end()))
                     r += 1
+                    ttk.Label(body, text="Font", style="PanelMuted.TLabel").grid(
+                        row=r, column=0, sticky="w", pady=(6, 0))
+                    self.font_var = tk.StringVar()
+                    self.font_box = ttk.Combobox(body, textvariable=self.font_var,
+                                                 state="readonly", width=26, height=20)
+                    self.font_box.grid(row=r, column=1, columnspan=3, sticky="ew", pady=(6, 0))
+                    self.font_box.bind("<<ComboboxSelected>>", lambda e: self.pick_font())
+                    r += 1
                 for key, label, lo, hi, step, fmt, slider in rows:
                     self.fields[(kind, key)] = SlideField(
                         body, r, label, lo, hi, step, fmt, CLIP_DEFAULTS[key],
@@ -2407,6 +2612,12 @@ class App:
             f.show(cp(c, key))
         if self.insp_kind == "c":
             self.hl_var.set(cp(c, "hl_color"))
+            names = sorted(installed_fonts(), key=str.lower)
+            if CAPTION_FONT not in installed_fonts():
+                names.insert(0, f"{CAPTION_FONT} (not installed)")
+            self.font_box.config(values=names)
+            want = cp(c, "font")
+            self.font_var.set(want if want in installed_fonts() else f"{want} (not installed)")
         if self.insp_kind == "c" and self.root.focus_get() is not self.cap_text:
             if self.cap_text.get("1.0", "end-1c") != c["caption"]:
                 self.cap_text.delete("1.0", "end")
@@ -2450,6 +2661,12 @@ class App:
             self.replay_job = self.root.after(300, self.replay)
         elif kind in ("v", "c"):
             self.queue_live()
+
+    def pick_font(self):
+        name = self.font_var.get().replace(" (not installed)", "")
+        self.insp_set("c", "font", name)
+        self.insp_end()
+        self.draw_timeline_soon()
 
     def cap_typed(self):
         """Typing in the Caption box: the focused caption takes the text (one undo step per
@@ -2526,7 +2743,7 @@ class App:
             return
         before = self.snapshot()
         keys = {k for _, rows in self.INSPECTOR[kind] for k, *_ in rows} | {"keep_pitch"}
-        keys |= {"highlight", "hl_color"} if kind == "c" else set()
+        keys |= {"highlight", "hl_color", "font"} if kind == "c" else set()
         keys |= {"flip_h", "flip_v"} if kind == "v" else set()
         ids = {i for c in clips for i in self.linked(c)}
         self.set_speed([c for c in self.clips if c["id"] in ids], 100.0)   # back to full length
@@ -3195,21 +3412,26 @@ class App:
         (file, fonts folder); files are named by their content, so renders running at the same
         time never share a file that changes."""
         fs, bord = caption_style(self.vw, self.vh)
-        font = caption_font_file()
-        family = caption_font(fs).getname()[0] if font else "Arial"
         fonts = CACHE_DIR / "fonts"
-        lines = []
+        lines, used = [], set()
         for c, s, e in caps:
+            face = cap_font(c)
+            used.add(face)
+            # by full name ("Yu Gothic Medium"), so libass takes that exact face and not another
+            # weight of the family; \b0 so it doesn't thicken a bold face again
+            family, style = caption_font(fs, face).getname()
+            full = family if style in (None, "", "Regular") else f"{family} {style}"
             x, y = self.vw / 2 + cp(c, "pos_x"), self.vh / 2 - cp(c, "pos_y")
             z = cp(c, "zoom") * 100
-            base = f"\\an5\\pos({x:.1f},{y:.1f})\\fscx{z:.1f}\\fscy{z:.1f}"
+            base = (f"\\fn{full}\\b0\\an5\\pos({x:.1f},{y:.1f})"
+                    f"\\fscx{z:.1f}\\fscy{z:.1f}")
             if cp(c, "rotation"):
                 base += f"\\frz{-cp(c, 'rotation'):.2f}"   # libass turns counterclockwise
             if cp(c, "opacity") < 100:
                 base += f"\\alpha&H{round(255 * (1 - cp(c, 'opacity') / 100)):02X}&"
             fi, fo = cp(c, "fade_in"), cp(c, "fade_out")
             rows = [[w.replace("{", "(").replace("}", ")") for w in line.split(" ")]
-                    for line in caption_lines(c["caption"], self.vw, self.vh)]
+                    for line in caption_lines(c["caption"], self.vw, self.vh, face)]
             # spoken-word highlight: one event per word, from its start to the next one's
             spans = [(s, e, None)]
             if cp(c, "highlight"):
@@ -3243,15 +3465,17 @@ class App:
                 "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, "
                 "BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, "
                 "BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
-                f"Style: Cap,{family},{fs},&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,"
+                f"Style: Cap,Arial,{fs},&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,"
                 f"-1,0,0,0,100,100,0,0,1,{bord},0,5,0,0,0,1\n\n[Events]\n"
                 "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
                 + "\n".join(lines) + "\n")
         path = CACHE_DIR / f"cap_{hashlib.md5(data.encode('utf-8')).hexdigest()[:16]}.ass"
         try:
-            if font and not (fonts / font.name).exists():
-                fonts.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(font, fonts / font.name)   # only this font, so libass starts fast
+            for face in used:   # only the fonts in use, so libass starts fast
+                src = Path(installed_fonts().get(face, ("",))[0])
+                if src.name and not (fonts / src.name).exists():
+                    fonts.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src, fonts / src.name)
             if not path.exists():
                 CACHE_DIR.mkdir(parents=True, exist_ok=True)
                 tmp = path.with_suffix(f".{threading.get_ident()}.tmp")
@@ -3362,7 +3586,8 @@ class App:
             if "caption" in c:   # drawn with the export's font, size and outline
                 im = caption_image(c["caption"], self.vw, self.vh, k * cp(c, "zoom"),
                                    active_word(c, t) if cp(c, "highlight") else None,
-                                   HL_COLORS.get(cp(c, "hl_color"), HL_COLORS["Yellow"]))
+                                   HL_COLORS.get(cp(c, "hl_color"), HL_COLORS["Yellow"]),
+                                   cap_font(c))
             else:
                 im = self.src_cache[self.src_key(c, t)]
                 cl, cr, ct, cb = (cp(c, x) / 100 for x in ("crop_l", "crop_r", "crop_t", "crop_b"))
@@ -3934,7 +4159,7 @@ class App:
         """(center x, center y, width, height, rotation) of a visual clip in frame pixels,
         placed the way graph() places it."""
         if "caption" in c:
-            w, h = caption_image(c["caption"], self.vw, self.vh, 1.0).size
+            w, h = caption_image(c["caption"], self.vw, self.vh, 1.0, face=cap_font(c)).size
             z = cp(c, "zoom")
             return (self.vw / 2 + cp(c, "pos_x"), self.vh / 2 - cp(c, "pos_y"), w * z, h * z,
                     cp(c, "rotation"))
@@ -4215,8 +4440,9 @@ class App:
                 for gpu in ([True, False] if self.cap_gpu is not False else [False]):
                     where = "GPU" if gpu else "CPU"
                     self.cap_proc = subprocess.Popen(
-                        [whisper_exe(), "-m", str(path), "-f", str(wav), "-l", lang, "-oj",
-                         "-of", str(out), "-ml", "1", "-sow", "-pp",
+                        [whisper_exe(), "-m", str(path), "-f", str(wav), "-l", lang, "-ojf",
+                         "-of", str(out), "-dtw", DTW_PRESETS.get(model, "large.v3.turbo"),
+                         "-nfa", "-sns", "-pp",   # DTW word times need flash attention off
                          "-t", str(max(2, (os.cpu_count() or 4) - 2))] + ([] if gpu else ["-ng"]),
                         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                         stdin=subprocess.DEVNULL, creationflags=BGWIN, text=True,
@@ -4245,13 +4471,14 @@ class App:
                     raise OSError("whisper failed: " + " ".join(tail)[-300:])
                 data = json.loads(out.with_suffix(".json").read_text(encoding="utf-8",
                                                                       errors="replace"))
+                say(f"Captions {n + 1}/{len(jobs)}: checking the timing of every word...", 1)
+                sents = whisper_sentences(data, audio_envelope(wav))
+                keep = self.check_sentences(sents, lang, wav, path, say, f"{n + 1}/{len(jobs)}")
                 words = []
-                for seg in data.get("transcription", []):
-                    w = seg.get("text", "").strip()
-                    if not w or re.fullmatch(r"[\[(].*[\])]|[♪♫\s]+", w):
-                        continue   # [BLANK_AUDIO], (music) and the like
-                    a, b = seg["offsets"]["from"] / 1000, seg["offsets"]["to"] / 1000
-                    words.append((c["start"] + a / k, c["start"] + b / k, w))
+                for sent, ok in zip(sents, keep):
+                    for a, b, w in sent[3] if ok else []:
+                        if not re.fullmatch(r"[\[(].*[\])]|[♪♫\s]+", w):   # [BLANK_AUDIO], (music)
+                            words.append((c["start"] + a / k, c["start"] + b / k, w))
                 end = c["start"] + c["dur"]
                 caps = [(a, min(b, end), t, ws) for a, b, t, ws in group_words(words, max_chars)
                         if a < end]
@@ -4261,6 +4488,59 @@ class App:
             self.q.put(("capdone", False, ""))
         except (OSError, ValueError, KeyError) as e:
             self.q.put(("capdone", False, str(e) or e.__class__.__name__))
+
+    def check_sentences(self, sents, lang, wav, model, say, job):
+        """Which sentences to keep: not the ones made up over silence, and with a language
+        picked, only that language. Each doubtful sentence's own sound is checked by whisper's
+        language detection (all in one run), plus what its words look like."""
+        keep = [loud for *_, loud in sents]
+        if lang not in ("en", "hu"):
+            return keep
+        other = "hu" if lang == "en" else "en"
+        doubt = []
+        for i, (a, b, text, ws, loud) in enumerate(sents):
+            if not keep[i]:
+                continue
+            said = text_language(text)
+            if said == other:
+                keep[i] = False
+            elif b - a >= 0.8 and len(ws) >= 2 and (
+                    self.cap_gpu or said is None or lang == "en"):
+                doubt.append(i)   # on the CPU only the ones the words don't settle
+        if not doubt:
+            return keep
+        say(f"Captions {job}: checking the language of {len(doubt)} sentences...", None)
+        files = []
+        try:
+            with wave.open(str(wav)) as w:
+                rate, frames = w.getframerate(), w.readframes(w.getnframes())
+            for n, i in enumerate(doubt):
+                a, b = sents[i][0], sents[i][1]
+                f = CACHE_DIR / f"captions_sentence{n}.wav"
+                with wave.open(str(f), "wb") as o:
+                    o.setnchannels(1)
+                    o.setsampwidth(2)
+                    o.setframerate(rate)
+                    o.writeframes(frames[int(a * rate) * 2:int(b * rate) * 2])
+                files.append(f)
+            self.cap_proc = subprocess.Popen(
+                [whisper_exe(), "-m", str(model), "-l", "auto", "-dl"] +
+                [x for f in files for x in ("-f", str(f))] + ([] if self.cap_gpu else ["-ng"]),
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                creationflags=BGWIN, text=True, errors="replace")
+            found = re.findall(r"auto-detected language: (\w+) \(p = ([\d.]+)\)",
+                               self.cap_proc.communicate()[0])
+        except OSError:
+            found = []
+        if self.cap_cancel:
+            raise InterruptedError
+        for i, (code, prob) in zip(doubt, found):
+            text = sents[i][2]
+            hu_text = any(ch in HU_LETTERS for ch in text.lower())
+            if code != lang and float(prob) >= (0.7 if lang == "en" else 0.6) and not (
+                    lang == "hu" and hu_text):
+                keep[i] = False
+        return keep
 
     def caption_media(self):
         """Caption clips point at a small transparent picture, so everything that handles image

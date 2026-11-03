@@ -13,7 +13,9 @@ inspector.
 - Auto captions (English, Hungarian or auto-detect) with [whisper.cpp](https://github.com/ggml-org/whisper.cpp),
   offline, on the GPU (AMD, NVIDIA, Intel via Vulkan) or the CPU: right-click a clip or use the
   inspector; captions are editable clips on their own track, and the spoken word lights up like in
-  CapCut. The speech model (Fast 190 MB or Accurate 574 MB) downloads on first use
+  CapCut. Word times are checked against the sound (typically within 50 ms), and with a
+  language picked only that language is captioned. Any installed font (default DFP King Gothic
+  Medium when installed). The speech model (Fast 190 MB or Accurate 574 MB) downloads on first use
 - Projects (`.qedit`) with a fixed resolution you pick (any size, e.g. 1080x1920), save, open and
   recent files; reusable templates, like a logo already
   placed on V2 that stretches to whatever video you drop in
