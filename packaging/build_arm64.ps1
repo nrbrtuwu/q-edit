@@ -55,6 +55,7 @@ Get-ChildItem "$site\tkinterdnd2\tkdnd" -Directory | Where-Object { $_.Name -ne 
     Remove-Item -Recurse -Force   # only the ARM64 tkdnd
 Get-ChildItem $site -Recurse -Directory -Filter "__pycache__" | Remove-Item -Recurse -Force
 Copy-Item "$root\clip_editor.py", "$root\clip_editor.ico" $app
+Copy-Item -Recurse "$root\fonts" "$app\fonts"   # Montserrat SemiBold (SIL OFL), the caption font
 Set-Content -Path "$app\installed" -Value "q-edit $version ARM64: settings live in %APPDATA%\q-edit"
 
 & $py "$here\check_arch.py" arm64 $app $ffmpeg.FullName $whisper

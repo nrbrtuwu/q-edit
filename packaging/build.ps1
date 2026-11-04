@@ -32,6 +32,7 @@ Write-Host "Building q-edit $version with $($ffmpeg.Name)"
 if ($LASTEXITCODE) { throw "icon failed" }
 & $py -m PyInstaller --noconfirm --clean --windowed --name "q-edit" `
     --icon "$root\clip_editor.ico" --add-data "$root\clip_editor.ico;." `
+    --add-data "$root\fonts;fonts" `
     --collect-data tkinterdnd2 `
     --distpath "$here\dist" --workpath "$here\build" --specpath "$here" "$root\clip_editor.py"
 if ($LASTEXITCODE) { throw "PyInstaller failed" }

@@ -77,7 +77,7 @@ IMAGE_DUR = 5.0
 MIN_CLIP = 0.05
 MEDIA_TYPES = [("Media", "*.mp4 *.mov *.mkv *.avi *.webm *.m4v *.mp3 *.wav *.m4a *.aac *.flac "
                          "*.ogg *.png *.jpg *.jpeg *.bmp *.webp"), ("All files", "*.*")]
-APP_VERSION = "1.12.0"
+APP_VERSION = "1.13.0"
 # True when installed: the x64 build's q-edit.exe, or the ARM64 build, which runs this script
 # on its own ARM64 Python and ships an "installed" marker file next to it
 FROZEN = getattr(sys, "frozen", False) or (Path(__file__).parent / "installed").exists()
@@ -104,8 +104,10 @@ DTW_SHIFT = 0.17
 CAPTION_LANGS = {"English": "en", "Hungarian": "hu", "Detect automatically": "auto"}
 CAPTION_LENGTHS = {"Short (a few words, TikTok style)": 18, "Long (up to two lines)": 42}
 FONTS_DIR = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
-CAPTION_FONT = "DFP King Gothic Medium"           # default; used when it is installed
-FALLBACK_FONTS = ["Segoe UI Bold", "Arial Bold"]   # otherwise, and for letters it doesn't have
+# default caption font: comes with q-edit (fonts/, SIL OFL), the free stand-in for Proxima Nova
+# Semibold, TikTok's "Classic" text style
+CAPTION_FONT = "Montserrat SemiBold"
+FALLBACK_FONTS = ["Montserrat SemiBold", "Segoe UI Bold", "Arial Bold"]   # for missing fonts / letters
 # a few of the most common words, to tell English and Hungarian sentences apart
 EN_WORDS = set("""the a an and or but of to in on at for with is are was were be been it this that
 these those you your i we they he she my our me us not no do does did have has had will would can
@@ -165,7 +167,7 @@ CLIP_DEFAULTS = {"zoom": 1.0, "pos_x": 0.0, "pos_y": 0.0, "rotation": 0.0, "flip
                  "flip_v": False, "crop_l": 0.0, "crop_r": 0.0, "crop_t": 0.0, "crop_b": 0.0,
                  "opacity": 100.0, "fade_in": 0.0, "fade_out": 0.0, "volume": 0.0, "pan": 0.0,
                  "speed": 100.0, "keep_pitch": True, "highlight": True, "hl_color": "Yellow",
-                 "font": "DFP King Gothic Medium"}
+                 "font": "Montserrat SemiBold"}
 THUMB_H = 72          # height thumbnails are extracted at
 PEAKS_PER_SEC = 100   # waveform resolution
 # glyphs from Segoe Fluent Icons / Segoe MDL2 Assets (built into Windows 10/11)
@@ -428,11 +430,18 @@ _cap_fonts, _font_list, _glyphs = {}, None, {}
 
 
 def installed_fonts():
-    """{font name: (file, index in a .ttc)} of the fonts installed for everyone and for this user,
-    as Windows lists them (e.g. "Segoe UI Bold")."""
+    """{font name: (file, index in a .ttc)} of the fonts that come with q-edit (fonts/, e.g.
+    "Montserrat SemiBold") and the ones installed for everyone and for this user, as Windows
+    lists them (e.g. "Segoe UI Bold")."""
     global _font_list
     if _font_list is None:
         _font_list = {}
+        for f in sorted((DATA_DIR / "fonts").glob("*.[ot]tf")):
+            try:
+                family, style = ImageFont.truetype(str(f), 20).getname()
+            except OSError:
+                continue
+            _font_list[family if style in (None, "", "Regular") else f"{family} {style}"] = (str(f), 0)
         try:
             import winreg
         except ImportError:
@@ -448,8 +457,8 @@ def installed_fonts():
                         if ext not in (".ttf", ".otf", ".ttc"):
                             continue
                         name = re.sub(r"\s*\((TrueType|OpenType)\)$", "", name)
-                        for n, part in enumerate(name.split(" & ")):
-                            _font_list[part.strip()] = (str(path), n if ext == ".ttc" else 0)
+                        for n, part in enumerate(name.split(" & ")):   # the bundled copy wins
+                            _font_list.setdefault(part.strip(), (str(path), n if ext == ".ttc" else 0))
             except OSError:
                 pass
     return _font_list
@@ -524,12 +533,13 @@ def has_glyphs(name, text):
 
 
 def cap_font(c):
-    """The installed font a caption is drawn with: its own, or the fallback when that isn't
-    installed or lacks some of the caption's letters."""
+    """The font a caption is drawn with: its own, or the first fallback that is there and has all
+    of the caption's letters."""
     face = font_face(cp(c, "font"))
-    if face and not has_glyphs(face, c["caption"]):
-        face = font_face(FALLBACK_FONTS[0])
-    return face
+    if face and has_glyphs(face, c["caption"]):
+        return face
+    fonts = installed_fonts()
+    return next((f for f in FALLBACK_FONTS if f in fonts and has_glyphs(f, c["caption"])), face)
 
 
 def caption_style(vw, vh):

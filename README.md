@@ -14,8 +14,8 @@ inspector.
   offline, on the GPU (AMD, NVIDIA, Intel via Vulkan) or the CPU: right-click a clip or use the
   inspector; captions are editable clips on their own track, and the spoken word lights up like in
   CapCut. Word times are checked against the sound (typically within 50 ms), and with a
-  language picked only that language is captioned. Any installed font (default DFP King Gothic
-  Medium when installed). The speech model (Fast 190 MB or Accurate 574 MB) downloads on first use
+  language picked only that language is captioned. Default font Montserrat SemiBold (bundled), or
+  any installed font. The speech model (Fast 190 MB or Accurate 574 MB) downloads on first use
 - Projects (`.qedit`) with a fixed resolution you pick (any size, e.g. 1080x1920), save, open and
   recent files; reusable templates, like a logo already
   placed on V2 that stretches to whatever video you drop in
@@ -50,6 +50,7 @@ that every program file in it is ARM64. The ARM64 build is untested on real ARM 
 The installer bundles [FFmpeg](https://ffmpeg.org) (GPL build from
 [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds)) and
 [whisper.cpp](https://github.com/ggml-org/whisper.cpp)'s whisper-cli (MIT); their licenses are installed
-alongside them. Speech models come from [ggerganov/whisper.cpp](https://huggingface.co/ggerganov/whisper.cpp)
+alongside them. The caption font [Montserrat](https://github.com/JulietaUla/Montserrat) SemiBold is
+bundled under the SIL Open Font License (`fonts/Montserrat-OFL.txt`). Speech models come from [ggerganov/whisper.cpp](https://huggingface.co/ggerganov/whisper.cpp)
 on Hugging Face. When running from source, put whisper-cli.exe on PATH (or unzip whisper-bin-x64.zip into
 `packaging/whisper_dl/bin`) for auto captions.
