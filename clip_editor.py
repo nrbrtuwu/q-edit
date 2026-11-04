@@ -77,9 +77,11 @@ IMAGE_DUR = 5.0
 MIN_CLIP = 0.05
 MEDIA_TYPES = [("Media", "*.mp4 *.mov *.mkv *.avi *.webm *.m4v *.mp3 *.wav *.m4a *.aac *.flac "
                          "*.ogg *.png *.jpg *.jpeg *.bmp *.webp"), ("All files", "*.*")]
-APP_VERSION = "1.11.0"
-FROZEN = getattr(sys, "frozen", False)  # True when running from the installed .exe
-APP_DIR = Path(sys.executable).parent if FROZEN else Path(__file__).parent
+APP_VERSION = "1.12.0"
+# True when installed: the x64 build's q-edit.exe, or the ARM64 build, which runs this script
+# on its own ARM64 Python and ships an "installed" marker file next to it
+FROZEN = getattr(sys, "frozen", False) or (Path(__file__).parent / "installed").exists()
+APP_DIR = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
 DATA_DIR = Path(getattr(sys, "_MEIPASS", APP_DIR))
 ICON_FILE = DATA_DIR / "clip_editor.ico"
 # the install folder is read-only, so the installed app keeps settings in %APPDATA%
@@ -5049,6 +5051,8 @@ def main():
         try:
             import ctypes
             ctypes.windll.shcore.SetProcessDpiAwareness(1)
+            # the taskbar groups the window with the q-edit shortcut, not with pythonw.exe
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("q-edit")
         except Exception:
             pass
     # the installer puts its own FFmpeg in an "ffmpeg" folder next to the app; prefer it

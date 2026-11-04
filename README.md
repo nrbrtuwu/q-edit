@@ -34,10 +34,16 @@ python clip_editor.py
 
 `tkinterdnd2` is optional; without it everything works except dragging files in from Explorer.
 
-## Build the installer
+## Build the installers
 
 See the comments at the top of [packaging/build.ps1](packaging/build.ps1). It builds
 `packaging/Output/q-edit-Setup-<version>.exe` with PyInstaller and Inno Setup and bundles FFmpeg.
+
+[packaging/build_arm64.ps1](packaging/build_arm64.ps1) builds `q-edit-Setup-<version>-arm64.exe` for
+Windows on ARM (Snapdragon PCs) on a normal x64 PC: PyInstaller can't cross-build, so it ships an ARM64
+Python (unpacked from python.org's installer by `arm64_python.py`) with `clip_editor.py`, the ARM64
+FFmpeg and the ARM64 whisper.cpp build with Snapdragon (Adreno) GPU support. `check_arch.py` checks
+that every program file in it is ARM64. The ARM64 build is untested on real ARM hardware.
 
 ## Third-party software
 

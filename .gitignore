@@ -18,3 +18,5 @@ packaging/build/
 packaging/dist/
 packaging/Output/
 packaging/*.spec
+packaging/arm64_dl/
+packaging/dist_arm64/

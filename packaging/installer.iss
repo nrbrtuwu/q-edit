@@ -44,10 +44,17 @@ Source: "whisper-LICENSE.txt"; DestDir: "{app}\whisper"
 Type: files; Name: "{app}\Clip Editor.exe"
 Type: files; Name: "{autoprograms}\Clip Editor.lnk"
 Type: files; Name: "{autodesktop}\Clip Editor.lnk"
+; what an ARM64 install left behind
+Type: filesandordirs; Name: "{app}\python"
+Type: filesandordirs; Name: "{app}\__pycache__"
+Type: filesandordirs; Name: "{app}\whisper"
+Type: files; Name: "{app}\clip_editor.py"
+Type: files; Name: "{app}\installed"
 
 [Icons]
-Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExe}"
-Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopicon
+; the app sets the same AppUserModelID, so its window groups with a pinned shortcut
+Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExe}"; AppUserModelID: "q-edit"
+Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; AppUserModelID: "q-edit"; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent
