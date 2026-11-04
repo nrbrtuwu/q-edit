@@ -77,7 +77,7 @@ IMAGE_DUR = 5.0
 MIN_CLIP = 0.05
 MEDIA_TYPES = [("Media", "*.mp4 *.mov *.mkv *.avi *.webm *.m4v *.mp3 *.wav *.m4a *.aac *.flac "
                          "*.ogg *.png *.jpg *.jpeg *.bmp *.webp"), ("All files", "*.*")]
-APP_VERSION = "1.13.0"
+APP_VERSION = "1.13.1"
 # True when installed: the x64 build's q-edit.exe, or the ARM64 build, which runs this script
 # on its own ARM64 Python and ships an "installed" marker file next to it
 FROZEN = getattr(sys, "frozen", False) or (Path(__file__).parent / "installed").exists()
@@ -2086,8 +2086,11 @@ class App:
         self.setup_dnd()
 
     def guard(self, fn):
+        """Window shortcuts, except while typing: in any text box (the Caption box is a
+        tk.Text) keys like Backspace, the arrows and Space edit the text instead."""
         def handler(e):
-            if isinstance(e.widget, (tk.Entry, ttk.Entry)) or self.export_proc:
+            if isinstance(e.widget, (tk.Entry, ttk.Entry, tk.Text, tk.Spinbox, ttk.Spinbox)) \
+                    or self.export_proc:
                 return None
             fn(e)
             return "break"
