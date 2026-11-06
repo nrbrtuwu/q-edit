@@ -77,7 +77,7 @@ IMAGE_DUR = 5.0
 MIN_CLIP = 0.05
 MEDIA_TYPES = [("Media", "*.mp4 *.mov *.mkv *.avi *.webm *.m4v *.mp3 *.wav *.m4a *.aac *.flac "
                          "*.ogg *.png *.jpg *.jpeg *.bmp *.webp"), ("All files", "*.*")]
-APP_VERSION = "1.14.0"
+APP_VERSION = "1.14.1"
 # True when installed: the x64 build's q-edit.exe, or the ARM64 build, which runs this script
 # on its own ARM64 Python and ships an "installed" marker file next to it
 FROZEN = getattr(sys, "frozen", False) or (Path(__file__).parent / "installed").exists()
@@ -3978,10 +3978,14 @@ class App:
                     messagebox.showerror("Error", f"FFmpeg could not read {Path(path).name}.")
                     continue
                 self.vw, self.vh = size
-                if not m["image"]:
-                    self.pfps = m["fps"]
                 self.crop = [0.0, 0.0, float(self.vw), float(self.vh)]
                 self.apply_ratio()
+            # the first real video sets the project's frame rate (export "Source"), whether or
+            # not the frame size was picked already in the Projects window
+            if m["video"] and not m["image"] and not any(
+                    c["kind"] == "v" and "caption" not in c and not self.media[c["path"]]["image"]
+                    for c in self.clips):
+                self.pfps = m["fps"]
 
             def end_of(kind, i):
                 return max((c["start"] + c["dur"] for c in self.clips
@@ -4873,6 +4877,12 @@ class App:
         self.clips = clips
         self.vw, self.vh = (int(v) for v in data.get("frame") or (0, 0))
         self.pfps = float(data.get("fps") or 30.0)
+        # the frame rate comes from the earliest real video; projects saved by 1.8.0-1.14.0
+        # stored 30 fps whatever the videos were
+        first = min((c for c in clips if c["kind"] == "v" and "caption" not in c
+                     and not self.media[c["path"]]["image"]), key=lambda c: c["start"], default=None)
+        if first:
+            self.pfps = self.media[first["path"]]["fps"]
         self.ratio.set(data.get("ratio", "Free"))
         self.outsize.set(data.get("outsize", ""))   # this resets the crop, so the crop comes after
         crop = data.get("crop")
