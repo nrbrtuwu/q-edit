@@ -77,7 +77,7 @@ IMAGE_DUR = 5.0
 MIN_CLIP = 0.05
 MEDIA_TYPES = [("Media", "*.mp4 *.mov *.mkv *.avi *.webm *.m4v *.mp3 *.wav *.m4a *.aac *.flac "
                          "*.ogg *.png *.jpg *.jpeg *.bmp *.webp"), ("All files", "*.*")]
-APP_VERSION = "1.13.1"
+APP_VERSION = "1.14.0"
 # True when installed: the x64 build's q-edit.exe, or the ARM64 build, which runs this script
 # on its own ARM64 Python and ships an "installed" marker file next to it
 FROZEN = getattr(sys, "frozen", False) or (Path(__file__).parent / "installed").exists()
@@ -303,7 +303,7 @@ def fmt_time(t):
 
 
 def probe(path):
-    """Returns {"dur", "fps", "audio", "video", "size"}."""
+    """Returns {"dur", "fps", "audio", "astreams" (how many audio streams), "video", "size"}."""
     r = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries",
          "format=duration:stream=codec_type,avg_frame_rate,r_frame_rate,width,height:"
@@ -313,15 +313,15 @@ def probe(path):
     try:
         info = json.loads(r.stdout)
     except ValueError:
-        return {"dur": 0.0, "fps": 30.0, "audio": False, "video": False}
+        return {"dur": 0.0, "fps": 30.0, "audio": False, "astreams": 0, "video": False}
     try:
         dur = float(info.get("format", {}).get("duration") or 0)
     except ValueError:
         dur = 0.0
-    fps, audio, got_video, size = 30.0, False, False, None
+    fps, astreams, got_video, size = 30.0, 0, False, None
     for s in info.get("streams", []):
-        if s.get("codec_type") == "audio":
-            audio = True
+        if s.get("codec_type") == "audio":   # OBS & co. record game, mic, ... as separate streams
+            astreams += 1
         elif s.get("codec_type") == "video" and not got_video:
             got_video = True
             if s.get("width") and s.get("height"):
@@ -344,7 +344,8 @@ def probe(path):
                 if 1 < v <= 240:
                     fps = v
                     break
-    return {"dur": dur, "fps": fps, "audio": audio, "video": got_video, "size": size}
+    return {"dur": dur, "fps": fps, "audio": astreams > 0, "astreams": astreams, "video": got_video,
+            "size": size}
 
 
 def read_media(path):
@@ -355,7 +356,8 @@ def read_media(path):
                 size = im.size
         except OSError:
             return None
-        return {"dur": 0.0, "fps": 30.0, "audio": False, "video": True, "image": True, "size": size}
+        return {"dur": 0.0, "fps": 30.0, "audio": False, "astreams": 0, "video": True, "image": True,
+                "size": size}
     info = probe(path)
     if info["dur"] > 0 and (info["video"] or info["audio"]):
         return dict(info, image=False)
@@ -391,11 +393,17 @@ def extract_thumbs(path, m):
     return step, imgs
 
 
-def extract_peaks(path):
-    """Waveform: loudest sample per 1/PEAKS_PER_SEC s, 0-255."""
+def astreams(m):
+    """How many audio streams a probed file has (probes cached before 1.14.0 only said yes / no)."""
+    return m.get("astreams", 1 if m.get("audio") else 0)
+
+
+def extract_peaks(path, stream=0):
+    """Waveform of one audio stream: loudest sample per 1/PEAKS_PER_SEC s, 0-255."""
     rate = 8000
-    raw = subprocess.run(["ffmpeg", "-v", "error", "-i", path, "-vn", "-ac", "1", "-ar", str(rate),
-                          "-f", "s16le", "-"], capture_output=True, creationflags=BGWIN).stdout
+    raw = subprocess.run(["ffmpeg", "-v", "error", "-i", path, "-map", f"0:a:{stream}", "-ac", "1",
+                          "-ar", str(rate), "-f", "s16le", "-"],
+                         capture_output=True, creationflags=BGWIN).stdout
     a = array("h")
     a.frombytes(raw[:len(raw) // 2 * 2])
     n = rate // PEAKS_PER_SEC
@@ -2995,7 +3003,7 @@ class App:
 
     def draw_wave(self, cl, X0, x0, x1, y0, y1):
         """Mirrored waveform, scaled by the clip's volume."""
-        pk = self.peaks.get(cl["path"])
+        pk = self.peaks.get((cl["path"], cl.get("stream", 0)))
         if not pk or y1 - y0 < 8:
             return
         mid, half = (y0 + y1) / 2, (y1 - y0) / 2 - 1
@@ -3023,17 +3031,20 @@ class App:
         for path in self.drop["paths"]:
             m = self.media.get(path)
             dur = self.drop_dur(path)
-            kinds = ([k for k, has in (("v", m["video"]), ("a", m["audio"])) if has] if m
-                     else [self.drop["kind"]])
-            for kind in kinds:
-                if track < len(self.tracks(kind)):
-                    _, _, y0, y1 = self.row_of(kind, track)
+            kinds = ((["v"] if m["video"] else []) + ["a"] * astreams(m) if m
+                     else [(self.drop["kind"])])
+            extra = 0   # audio streams past the last audio track go on new tracks below it
+            for n, kind in enumerate(kinds):
+                tr = track + (n - (1 if m and m["video"] else 0) if kind == "a" and m else 0)
+                if tr < len(self.tracks(kind)):
+                    _, _, y0, y1 = self.row_of(kind, tr)
                 elif kind == "v":   # a new track will be added above the top one
                     y1 = rows[0][2]
                     y0 = y1 - VT_H
                 else:               # ... or below the last audio track
-                    y0 = rows[-1][3]
+                    y0 = rows[-1][3] + extra * AT_H
                     y1 = y0 + AT_H
+                    extra += 1
                 x0, x1 = self.t2x(t), self.t2x(t + dur)
                 c.create_rectangle(x0 + 1, y0 + 2, x1 - 1, y1 - 3, fill=ACCENT, stipple="gray25",
                                    outline=ACCENT, width=2, dash=(4, 2), tags="drop")
@@ -3408,7 +3419,7 @@ class App:
                 for c, s, e in spans("a", ti):
                     inputs += ["-ss", f"{c['inp'] + (s - c['start']) * spd(c):.3f}",
                                "-t", f"{(e - s) * spd(c):.3f}", "-i", c["path"]]
-                    parts.append(f"[{n}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts="
+                    parts.append(f"[{n}:a:{c.get('stream', 0)}]aresample=48000,aformat=sample_fmts=fltp:channel_layouts="
                                  f"stereo,{self.audio_chain(c, s)}apad,atrim=duration={e - s:.3f},"
                                  f"adelay={int(round((s - t0) * 1000))}:all=1[a{n}]")
                     labels.append(f"[a{n}]")
@@ -3933,8 +3944,8 @@ class App:
         def work():
             if m["video"]:
                 self.q.put(("thumbs", path, extract_thumbs(path, m)))
-            if m["audio"]:
-                self.q.put(("peaks", path, extract_peaks(path)))
+            for k in range(astreams(m)):   # waveforms are keyed (path, audio stream)
+                self.q.put(("peaks", (path, k), extract_peaks(path, k)))
         threading.Thread(target=work, daemon=True).start()
 
     def add_media(self, paths=None, drop=None):
@@ -3980,19 +3991,24 @@ class App:
                 start = cursor
                 cursor += dur
             else:
-                start = max(end_of("v", vt) if m["video"] else 0.0,
-                            end_of("a", at) if m["audio"] else 0.0)
-            link = self.new_id() if m["video"] and m["audio"] else None
-            for kind, track, has in (("v", vt, m["video"]), ("a", at, m["audio"])):
-                if has:
-                    while len(self.tracks(kind)) <= track:
-                        self.tracks(kind).append({"hidden": False} if kind == "v" else {"muted": False})
-                    c = {"id": self.new_id(), "kind": kind, "track": track, "path": path,
-                         "start": start, "inp": 0.0, "dur": dur, "link": link}
-                    if drop:
-                        self.clear_range(kind, track, start, start + dur, set(added))
-                    self.clips.append(c)
-                    added.append(c["id"])
+                start = max([end_of("v", vt) if m["video"] else 0.0] +
+                            [end_of("a", at + k) for k in range(astreams(m))])
+            # a file with several audio streams (game + mic, ...) gets one audio clip per stream on
+            # tracks An, An+1, ..., all linked to its video
+            parts = ([("v", vt, None)] if m["video"] else []) + \
+                [("a", at + k, k) for k in range(astreams(m))]
+            link = self.new_id() if len(parts) > 1 else None
+            for kind, track, stream in parts:
+                while len(self.tracks(kind)) <= track:
+                    self.tracks(kind).append({"hidden": False} if kind == "v" else {"muted": False})
+                c = {"id": self.new_id(), "kind": kind, "track": track, "path": path,
+                     "start": start, "inp": 0.0, "dur": dur, "link": link}
+                if stream:
+                    c["stream"] = stream
+                if drop:
+                    self.clear_range(kind, track, start, start + dur, set(added))
+                self.clips.append(c)
+                added.append(c["id"])
         if not added:
             self.status.config(text="Ready")
             return
@@ -4358,7 +4374,8 @@ class App:
 
     # ---------- auto captions ----------
     def caption_sources(self):
-        """Selected clips with sound to caption: one per linked video / audio pair."""
+        """Selected clips with sound to caption: one per linked group (a video and its audio
+        streams); a lone audio clip captions its own stream."""
         out, links = [], set()
         for c in self.clips:
             if c["id"] not in self.sel or "caption" in c:
@@ -4440,7 +4457,8 @@ class App:
                 say(f"Captions {n + 1}/{len(jobs)}: reading the sound of {name}...", 0)
                 k = spd(c)
                 r = subprocess.run(["ffmpeg", "-y", "-v", "error", "-ss", f"{c['inp']:.3f}",
-                                    "-t", f"{c['dur'] * k:.3f}", "-i", c["path"], "-vn", "-ac", "1",
+                                    "-t", f"{c['dur'] * k:.3f}", "-i", c["path"],
+                                    "-map", f"0:a:{c.get('stream', 0)}", "-ac", "1",
                                     "-ar", "16000", "-c:a", "pcm_s16le", str(wav)],
                                    capture_output=True, text=True, creationflags=NOWIN)
                 if r.returncode:

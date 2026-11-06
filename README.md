@@ -7,7 +7,8 @@ inspector.
 
 - Timeline with any number of video and audio tracks: cut, split, trim, ripple delete, snapping,
   undo / redo, filmstrip thumbnails and audio waveforms
-- Drag and drop videos, images, audio files or whole folders from Explorer
+- Drag and drop videos, images, audio files or whole folders from Explorer; videos with several audio tracks
+  (game + mic, ...) get one audio clip per track
 - Inspector for each clip: zoom, position, rotation, flip, cropping, opacity, fades, volume, pan,
   speed (10-400%, with or without pitch correction); move and scale clips right on the preview
 - Auto captions (English, Hungarian or auto-detect) with [whisper.cpp](https://github.com/ggml-org/whisper.cpp),
