@@ -17,6 +17,9 @@ inspector.
   CapCut. Word times are checked against the sound (typically within 50 ms), and with a
   language picked only that language is captioned. Default font Montserrat SemiBold (bundled), or
   any installed font. The speech model (Fast 190 MB or Accurate 574 MB) downloads on first use
+- Text: press T (or the toolbar's text button, Edit > Add text, right-click the timeline) for a
+  5 s text clip at the playhead above the video; type it in the inspector, drag and scale it in the
+  preview, pick font, size, rotation, opacity and fades
 - Projects (`.qedit`) with a fixed resolution you pick (any size, e.g. 1080x1920), save, open and
   recent files; reusable templates, like a logo already
   placed on V2 that stretches to whatever video you drop in

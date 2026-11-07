@@ -17,6 +17,7 @@ Shortcuts:
   I / O         mark in / out at the playhead (export and loop range)
   Home / End    jump to in / out
   Ctrl+B        split clips at the playhead
+  T             add text at the playhead
   Ctrl+C / X / V  copy / cut / paste clips (paste goes in at the playhead)
   Del           delete selected clips   (Shift+Del: ripple delete, closes the gap)
   Ctrl+Z / Y    undo / redo
@@ -77,7 +78,7 @@ IMAGE_DUR = 5.0
 MIN_CLIP = 0.05
 MEDIA_TYPES = [("Media", "*.mp4 *.mov *.mkv *.avi *.webm *.m4v *.mp3 *.wav *.m4a *.aac *.flac "
                          "*.ogg *.png *.jpg *.jpeg *.bmp *.webp"), ("All files", "*.*")]
-APP_VERSION = "1.14.1"
+APP_VERSION = "1.15.0"
 # True when installed: the x64 build's q-edit.exe, or the ARM64 build, which runs this script
 # on its own ARM64 Python and ships an "installed" marker file next to it
 FROZEN = getattr(sys, "frozen", False) or (Path(__file__).parent / "installed").exists()
@@ -175,7 +176,7 @@ ICON = {k: chr(int(v, 16)) for k, v in dict(
     open="E8E5", add="E710", image="EB9F", video="E714", music="E8D6", cut="E8C6",
     delete="E74D", ripple="E750", undo="E7A7", redo="E7A6", zin="E8A3", zout="E71F", fit="E9A6",
     export="E898", vol="E767", mute="E74F", link="E71B", loop="E8EE", play="E768", pause="E769",
-    prev="E892", next="E893", cancel="E711", eye="E7B3", hide="ED1A").items()}
+    prev="E892", next="E893", cancel="E711", eye="E7B3", hide="ED1A", text="E8D2").items()}
 ICON_FONT = "Segoe MDL2 Assets"  # replaced by Segoe Fluent Icons in apply_theme when installed
 
 
@@ -1904,6 +1905,7 @@ class App:
                       ("Cut", "Ctrl+X", lambda: self.copy_sel(True)),
                       ("Copy", "Ctrl+C", self.copy_sel),
                       ("Paste at playhead", "Ctrl+V", self.paste), None,
+                      ("Add text", "T", self.add_text),
                       ("Auto captions…", "", self.auto_captions), None,
                       ("Split at playhead", "Ctrl+B", self.split),
                       ("Delete", "Del", self.delete_sel),
@@ -2014,6 +2016,7 @@ class App:
         self.tool(tb, "video", lambda: self.add_track("v"), "Add video track")
         self.tool(tb, "music", lambda: self.add_track("a"), "Add audio track")
         self.tool(tb, "add", self.add_media, "Import media  (Ctrl+I)")
+        self.tool(tb, "text", self.add_text, "Add text at the playhead  (T)")
 
         for w in (self.btn(tb, ICON["fit"], self.zoom_fit, style="Tool.TButton",
                            tip="Zoom to fit  (Shift+Z)"),
@@ -2062,6 +2065,7 @@ class App:
                         ("<Shift-Right>", lambda e: self.step(5)),
                         ("<KeyPress-i>", lambda e: self.set_start()),
                         ("<KeyPress-o>", lambda e: self.set_end()),
+                        ("<KeyPress-t>", lambda e: self.add_text()),
                         ("<KeyPress-n>", lambda e: self.snap.set(not self.snap.get())),
                         ("<KeyPress-Z>", lambda e: self.zoom_fit()),
                         ("<KeyPress-plus>", lambda e: self.zoom(1.5)),
@@ -2616,7 +2620,8 @@ class App:
         self.insp_empty.pack_forget()
         c = clips[0]
         more = f"   (+{len(clips) - 1} more)" if len(clips) > 1 else ""
-        self.insp_name.config(text=("Caption at " + fmt_time(c["start"]) if "caption" in c
+        self.insp_name.config(text=(("Caption at " if "words" in c else "Text at ") +
+                                    fmt_time(c["start"]) if "caption" in c
                                     else Path(c["path"]).name[:40]) + more)
         if self.insp_shown != self.insp_kind:   # layout work only when the tab changes
             body = self.insp_body[self.insp_kind]
@@ -3344,6 +3349,9 @@ class App:
             if not cl:
                 menu.add_command(label=f"Paste here   ({fmt_time(at)})",
                                  command=lambda: self.paste(at), state=paste_here)
+                vt = r[1] if r and r[0] == "v" else None
+                menu.add_command(label=f"Add text here   ({fmt_time(at)})",
+                                 command=lambda: self.add_text(at, vt))
                 menu.tk_popup(e.x_root, e.y_root)
                 return
             if cl["id"] not in self.sel:
@@ -4615,6 +4623,42 @@ class App:
         self.sel = {c["id"] for c in new}
         self.insp_focus, self.insp_kind = new[0]["id"], "c"
         self.commit(before)
+
+    def add_text(self, at=None, track=None):
+        """A text element: a caption clip (same renderer, inspector and font) typed by hand,
+        IMAGE_DUR long at the playhead (or `at`), centred, on the lowest video track that is
+        above every video under it and free there (a new top track if none is)."""
+        before = self.snapshot()
+        if not self.vw:
+            self.set_frame((1920, 1080))
+        start = self.cur if at is None else at
+        end = start + IMAGE_DUR
+
+        def busy(i):
+            return any(c["kind"] == "v" and c["track"] == i and c["start"] < end - 1e-6
+                       and c["start"] + c["dur"] > start + 1e-6 for c in self.clips)
+        if track is None or busy(track):
+            under = [c["track"] for c in self.clips if c["kind"] == "v" and "caption" not in c
+                     and c["start"] < end and c["start"] + c["dur"] > start]
+            track = next((i for i in range(max(under, default=-1) + 1, len(self.vtracks))
+                          if not busy(i)), len(self.vtracks))
+        while len(self.vtracks) <= track:
+            self.vtracks.append({"hidden": False})
+        c = {"id": self.new_id(), "kind": "v", "track": track, "path": self.caption_media(),
+             "start": start, "inp": 0.0, "dur": IMAGE_DUR, "link": None, "caption": "Text",
+             "highlight": False}
+        self.clips.append(c)
+        self.sel = {c["id"]}
+        self.insp_focus, self.insp_kind = c["id"], "c"
+        self.commit(before)
+
+        def type_now():   # ready to type over "Text"
+            self.refresh_inspector(force=True)
+            self.cap_text.focus_set()
+            self.cap_text.tag_add("sel", "1.0", "end-1c")
+            self.cap_text.mark_set("insert", "end-1c")
+        self.root.after_idle(type_now)
+        self.status.config(text="Text added   ·   type in the Caption box, drag it in the preview")
 
     def finish_captions(self, ok, err):
         self.cap_proc = None
